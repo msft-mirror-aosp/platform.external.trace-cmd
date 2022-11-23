@@ -381,7 +381,12 @@ enum tracecmd_msg_flags {
 };
 
 /* for both client and server */
+#ifdef __ANDROID__
+#define MSG_CACHE_FILE "/data/local/tmp/trace_msg_cacheXXXXXX"
+#else	/* !__ANDROID__ */
 #define MSG_CACHE_FILE "/tmp/trace_msg_cacheXXXXXX"
+#endif	/* __ANDROID__ */
+
 struct tracecmd_msg_handle {
 	int			fd;
 	short			cpu_count;
