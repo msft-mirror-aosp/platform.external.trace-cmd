@@ -13,8 +13,6 @@ license {
         "SPDX-license-identifier-GPL-2.0-only",
         "SPDX-license-identifier-GPL-2.0+",
         "SPDX-license-identifier-GPL-2.0-or-later",
-        "SPDX-license-identifier-GPL-2.0-or-later",
-        "SPDX-license-identifier-LGPL-2.1+",
         "SPDX-license-identifier-LGPL-2.1+",
     ],
 
