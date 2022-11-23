@@ -124,7 +124,12 @@ static int attach_guest_fifos(const char *guest, int nr_cpus)
 	char cmd[PATH_MAX], xml[PATH_MAX];
 	int i, fd, ret = 0;
 
+#ifdef __ANDROID__
+	strcpy(tmp_path, "/data/local/tmp/pipexmlXXXXXX");
+#else	/* !__ANDROID__ */
 	strcpy(tmp_path, "/tmp/pipexmlXXXXXX");
+#endif	/* __ANDROID__ */
+
 	fd = mkstemp(tmp_path);
 	if (fd < 0)
 		return fd;

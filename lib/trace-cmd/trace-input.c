@@ -67,14 +67,24 @@ struct zchunk_cache {
 struct cpu_zdata {
 	/* uncompressed cpu data */
 	int			fd;
+#ifdef __ANDROID__
+	char			file[37]; /* strlen(COMPR_TEMP_FILE) */
+#else	/* !__ANDROID__ */
 	char			file[26]; /* strlen(COMPR_TEMP_FILE) */
+#endif	/* __ANDROID__ */
+
 	unsigned int		count;
 	unsigned int		last_chunk;
 	struct list_head	cache;
 	struct tracecmd_compress_chunk	*chunks;
 };
 
+#ifdef __ANDROID__
+#define COMPR_TEMP_FILE "/data/local/tmp/trace_cpu_dataXXXXXX"
+#else	/* !__ANDROID__ */
 #define COMPR_TEMP_FILE "/tmp/trace_cpu_dataXXXXXX"
+#endif	/* __ANDROID__ */
+
 struct cpu_data {
 	/* the first two never change */
 	unsigned long long	file_offset;
