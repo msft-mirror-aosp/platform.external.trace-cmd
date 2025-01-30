@@ -24,19 +24,6 @@ static inline int is_top_instance(struct buffer_instance *instance)
 	return instance == &top_instance;
 }
 
-static int get_instance_file_fd(struct buffer_instance *instance,
-				const char *file)
-{
-	char *path;
-	int fd;
-
-	path = tracefs_instance_get_file(instance->tracefs, file);
-	fd = open(path, O_RDONLY);
-	tracefs_put_tracing_file(path);
-
-	return fd;
-}
-
 char *strstrip(char *str)
 {
 	char *s;
@@ -71,21 +58,24 @@ char *append_file(const char *dir, const char *name)
 
 static char *get_fd_content(int fd, const char *file)
 {
+	size_t total = 0;
+	size_t alloc;
 	char *str = NULL;
-	int cnt = 0;
 	int ret;
 
 	for (;;) {
-		str = realloc(str, BUFSIZ * ++cnt);
+		alloc = ((total + BUFSIZ) / BUFSIZ) * BUFSIZ;
+		str = realloc(str, alloc + 1);
 		if (!str)
 			die("malloc");
-		ret = read(fd, str + BUFSIZ * (cnt - 1), BUFSIZ);
+		ret = read(fd, str + total, alloc - total);
 		if (ret < 0)
 			die("reading %s\n", file);
-		if (ret < BUFSIZ)
+		total += ret;
+		if (!ret)
 			break;
 	}
-	str[BUFSIZ * (cnt-1) + ret] = 0;
+	str[total] = 0;
 
 	return str;
 }
@@ -105,22 +95,6 @@ char *get_file_content(const char *file)
 	return str;
 }
 
-static char *get_instance_file_content(struct buffer_instance *instance,
-				       const char *file)
-{
-	char *str = NULL;
-	int fd;
-
-	fd = get_instance_file_fd(instance, file);
-	if (fd < 0)
-		return NULL;
-
-	str = get_fd_content(fd, file);
-
-	close(fd);
-	return str;
-}
-
 static void report_file(struct buffer_instance *instance,
 			char *name, char *def_value, char *description)
 {
@@ -129,7 +103,7 @@ static void report_file(struct buffer_instance *instance,
 
 	if (!tracefs_file_exists(instance->tracefs, name))
 		return;
-	str = get_instance_file_content(instance, name);
+	str = tracefs_instance_file_read(instance->tracefs, name, NULL);
 	if (!str)
 		return;
 	cont = strstrip(str);
@@ -343,7 +317,7 @@ static void report_events(struct buffer_instance *instance)
 	enum event_process processed = PROCESSED_NONE;
 	enum event_process processed_part = PROCESSED_NONE;
 
-	str = get_instance_file_content(instance, "events/enable");
+	str = tracefs_instance_file_read(instance->tracefs, "events/enable", NULL);
 	if (!str)
 		return;
 
@@ -659,9 +633,11 @@ static void report_buffers(struct buffer_instance *instance)
 	char *str;
 	char *cont;
 	char file[FILE_SIZE];
+	int pagesize;
+	int bufsize;
 	int cpu;
 
-	str = get_instance_file_content(instance, "buffer_size_kb");
+	str = tracefs_instance_file_read(instance->tracefs, "buffer_size_kb", NULL);
 	if (!str)
 		return;
 
@@ -681,7 +657,7 @@ static void report_buffers(struct buffer_instance *instance)
 	for (cpu = 0; ; cpu++) {
 
 		snprintf(file, FILE_SIZE, "per_cpu/cpu%d/buffer_size_kb", cpu);
-		str = get_instance_file_content(instance, file);
+		str = tracefs_instance_file_read(instance->tracefs, file, NULL);
 		if (!str)
 			break;
 
@@ -696,13 +672,18 @@ static void report_buffers(struct buffer_instance *instance)
  total:
 	free(str);
 
-	str = get_instance_file_content(instance, "buffer_total_size_kb");
+	str = tracefs_instance_file_read(instance->tracefs, "buffer_total_size_kb", NULL);
 	if (!str)
 		return;
 
 	cont = strstrip(str);
 	printf("\nBuffer total size in kilobytes:\n");
 	printf("   %s\n", str);
+
+	pagesize = getpagesize();
+	bufsize = tracefs_instance_get_subbuf_size(instance->tracefs);
+	if (bufsize > 0 && bufsize * 1024 != pagesize)
+		printf("\nSub-buffer size in kilobytes:\n   %d\n", bufsize);
 
  out:
 	free(str);
@@ -730,7 +711,7 @@ static void report_cpumask(struct buffer_instance *instance)
 	int n;
 	int i;
 
-	str = get_instance_file_content(instance, "tracing_cpumask");
+	str = tracefs_instance_file_read(instance->tracefs, "tracing_cpumask", NULL);
 	if (!str)
 		return;
 
@@ -780,7 +761,7 @@ static void report_probes(struct buffer_instance *instance,
 	int newline;
 	int i;
 
-	str = get_instance_file_content(instance, file);
+	str = tracefs_instance_file_read(instance->tracefs, file, NULL);
 	if (!str)
 		return;
 
@@ -815,12 +796,17 @@ static void report_uprobes(struct buffer_instance *instance)
 	report_probes(instance, "uprobe_events", "Uprobe events");
 }
 
+static void report_synthetic(struct buffer_instance *instance)
+{
+	report_probes(instance, "synthetic_events", "Synthetic events");
+}
+
 static void report_traceon(struct buffer_instance *instance)
 {
 	char *str;
 	char *cont;
 
-	str = get_instance_file_content(instance, "tracing_on");
+	str = tracefs_instance_file_read(instance->tracefs, "tracing_on", NULL);
 	if (!str)
 		return;
 
@@ -856,9 +842,13 @@ static void stat_instance(struct buffer_instance *instance, bool opt)
 	report_file(instance, "tracing_max_latency", "0", "Max Latency: ");
 	report_kprobes(instance);
 	report_uprobes(instance);
+	report_synthetic(instance);
 	report_file(instance, "set_event_pid", "", "Filtered event PIDs:\n");
+	report_file(instance, "set_event_notrace_pid", "", "Filtered notrace event PIDs:\n");
 	report_file(instance, "set_ftrace_pid", "no pid",
 		    "Filtered function tracer PIDs:\n");
+	report_file(instance, "set_ftrace_notrace_pid", "no pid",
+		    "Filtered function tracer notrace PIDs:\n");
 	if (opt) {
 		printf("\nOptions:\n");
 		show_options("   ", instance);

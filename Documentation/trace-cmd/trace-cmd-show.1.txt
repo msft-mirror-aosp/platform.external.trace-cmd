@@ -60,6 +60,19 @@ OPTIONS
 *--buffer_total_size*::
      Show the total size of all buffers.
 
+*--buffer_subbuf_size*::
+     Show the size in kilobytes of the sub-buffers of the ring buffer.
+     The ring buffer is broken up into equal size sub-buffers were an event can only
+     be as big as the sub-buffer data section (the size minus its meta data).
+
+*--buffer_percent*::
+    Show the percentage the buffer must be filled before a reader that is blocked
+    on the trace_pipe_raw file will be woken up.
+
+  0       : wake up immediately on any new data
+  1 - 99  : wake up on this percentage of the sub-buffers being full
+  100     : wake up after the buffer is full and the writer is on the last sub-buffer
+
 *--ftrace_filter*::
      Show what function filters are set.
 
@@ -74,6 +87,12 @@ OPTIONS
 
 *--graph_notrace*::
      Show the functions that will not be graphed.
+
+*--hist* '[system:]event'::
+     Show the content of a histogram "hist" file for a given event
+
+*--trigger* '[system:]event'::
+     Show the content of the "trigger" file for a given event
 
 *--cpumask*::
      Show the mask of CPUs that tracing will trace.
