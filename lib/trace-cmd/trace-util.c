@@ -30,7 +30,8 @@
 #define PROC_STACK_FILE "/proc/sys/kernel/stack_tracer_enabled"
 
 static bool debug;
-static int log_level = TEP_LOG_INFO;
+static bool notimeout;
+static int log_level = TEP_LOG_WARNING;
 static FILE *logfp;
 
 const static struct {
@@ -110,21 +111,28 @@ bool tracecmd_get_debug(void)
 	return debug;
 }
 
-void tracecmd_parse_cmdlines(struct tep_handle *pevent,
-			     char *file, int size __maybe_unused)
+/**
+ * tracecmd_set_notimeout - Do not timeout waiting for responses
+ * @set_notimeout: True or false to set notimeout mode.
+ *
+ * If @set_notimeout is true, then the library will not fail waiting for
+ * responses. This is useful when running the code under gdb.
+ * Note, if debug is set, then this makes no difference as it will always
+ * not timeout.
+ */
+void tracecmd_set_notimeout(bool set_notimeout)
 {
-	char *comm;
-	char *line;
-	char *next = NULL;
-	int pid;
+	notimeout = set_notimeout;
+}
 
-	line = strtok_r(file, "\n", &next);
-	while (line) {
-		sscanf(line, "%d %m[^\n]s", &pid, &comm);
-		tep_register_comm(pevent, comm, pid);
-		free(comm);
-		line = strtok_r(NULL, "\n", &next);
-	}
+/**
+ * tracecmd_get_notimeout - Get setting of notimeout of tracecmd library
+ * Returns true, if the tracecmd library has notimeout set.
+ *
+ */
+bool tracecmd_get_notimeout(void)
+{
+	return notimeout || debug;
 }
 
 void tracecmd_parse_proc_kallsyms(struct tep_handle *pevent,
@@ -254,11 +262,11 @@ static void add_plugin_file(struct tep_handle *pevent, const char *path,
 	if (!ptr)
 		goto out_free;
 
+	pdata->files = ptr;
 	ptr[pdata->index] = strdup(name);
 	if (!ptr[pdata->index])
 		goto out_free;
 
-	pdata->files = ptr;
 	pdata->index++;
 	pdata->files[pdata->index] = NULL;
 	return;
@@ -368,8 +376,6 @@ trace_load_plugins(struct tep_handle *tep, int flags)
 void tracecmd_set_loglevel(enum tep_loglevel level)
 {
 	log_level = level;
-	tracefs_set_loglevel(level);
-	tep_set_loglevel(level);
 }
 
 void __weak tracecmd_warning(const char *fmt, ...)
@@ -430,7 +436,6 @@ void __weak tracecmd_debug(const char *fmt, ...)
 #define LOG_BUF_SIZE 1024
 static void __plog(const char *prefix, const char *fmt, va_list ap, FILE *fp)
 {
-	static int newline = 1;
 	char buf[LOG_BUF_SIZE];
 	int r;
 
@@ -440,11 +445,7 @@ static void __plog(const char *prefix, const char *fmt, va_list ap, FILE *fp)
 		r = LOG_BUF_SIZE;
 
 	if (logfp) {
-		if (newline)
-			fprintf(logfp, "[%d]%s%.*s", getpid(), prefix, r, buf);
-		else
-			fprintf(logfp, "[%d]%s%.*s", getpid(), prefix, r, buf);
-		newline = buf[r - 1] == '\n';
+		fprintf(logfp, "[%d]%s%.*s", getpid(), prefix, r, buf);
 		fflush(logfp);
 		return;
 	}
@@ -534,6 +535,7 @@ int tracecmd_stack_tracer_status(int *status)
 
 	buf[n] = 0;
 
+	errno = 0;
 	num = strtol(buf, NULL, 10);
 
 	/* Check for various possible errors */

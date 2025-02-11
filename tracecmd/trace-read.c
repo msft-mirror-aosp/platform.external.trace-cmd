@@ -3,7 +3,6 @@
  * Copyright (C) 2009, 2010 Red Hat Inc, Steven Rostedt <srostedt@redhat.com>
  *
  */
-#define _LARGEFILE64_SOURCE
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,32 +40,27 @@ static struct filter_str {
 } *filter_strings;
 static struct filter_str **filter_next = &filter_strings;
 
-struct filter {
-	struct filter		*next;
-	struct tep_event_filter	*filter;
-};
-
 struct event_str {
 	struct event_str	*next;
 	const char		*event;
 };
 
+struct input_files;
+
 struct handle_list {
 	struct list_head	list;
 	struct tracecmd_input	*handle;
+	struct input_files	*input_file;
 	const char		*file;
 	int			cpus;
-	int			done;
-	struct tep_record	*record;
-	struct filter		*event_filters;
-	struct filter		*event_filter_out;
-	unsigned long long	*last_timestamp;
 };
 static struct list_head handle_list;
 
 struct input_files {
 	struct list_head	list;
 	const char		*file;
+	struct filter_str	*filter_str;
+	struct filter_str	**filter_str_next;
 	long long		tsoffset;
 	unsigned long long	ts2secs;
 };
@@ -98,7 +92,6 @@ static int show_wakeup;
 static int wakeup_id;
 static int wakeup_new_id;
 static int sched_id;
-static int stacktrace_id;
 
 static int profile;
 
@@ -157,7 +150,8 @@ static void print_event_name(struct trace_seq *s, struct tep_event *event)
 
 enum time_fmt {
 	TIME_FMT_LAT		= 1,
-	TIME_FMT_NORMAL		= 2,
+	TIME_FMT_NORMAL,
+	TIME_FMT_TS,
 };
 
 static const char *time_format(struct tracecmd_input *handle, enum time_fmt tf)
@@ -172,11 +166,11 @@ static const char *time_format(struct tracecmd_input *handle, enum time_fmt tf)
 	default:
 		if (tracecmd_get_flags(handle) & TRACECMD_FL_IN_USECS) {
 			if (tep_test_flag(tep, TEP_NSEC_OUTPUT))
-				return " %9.1d:";
+				return tf == TIME_FMT_NORMAL ? " %9.1d:" : "%9.1d";
 			else
-				return " %6.1000d:";
+				return tf == TIME_FMT_NORMAL ? " %6.1000d:" : "%6.1000d";
 		} else
-			return "%12d:";
+			return tf == TIME_FMT_NORMAL ? "%12d:" : "%12d";
 	}
 }
 
@@ -200,7 +194,7 @@ static void print_event(struct trace_seq *s, struct tracecmd_input *handle,
 #define TEST_READ_AT 0
 #if TEST_READ_AT
 #define DO_TEST
-static off64_t test_read_at_offset;
+static off_t test_read_at_offset;
 static int test_read_at_copy = 100;
 static int test_read_at_index;
 static void show_test(struct tracecmd_input *handle)
@@ -338,29 +332,42 @@ static void test_save(struct tep_record *record, int cpu)
 }
 #endif
 
-static void add_input(const char *file)
+static void free_filter_strings(struct filter_str *filter_str)
+{
+	struct filter_str *filter;
+
+	while (filter_str) {
+		filter = filter_str;
+		filter_str = filter->next;
+		free(filter->filter);
+		free(filter);
+	}
+}
+
+static struct input_files *add_input(const char *file)
 {
 	struct input_files *item;
 
-	item = malloc(sizeof(*item));
+	item = calloc(1, sizeof(*item));
 	if (!item)
 		die("Failed to allocate for %s", file);
-	memset(item, 0, sizeof(*item));
 	item->file = file;
+	item->filter_str_next = &item->filter_str;
 	list_add_tail(&item->list, &input_files);
 	last_input_file = item;
+	return item;
 }
 
-static void add_handle(struct tracecmd_input *handle, const char *file)
+static void add_handle(struct tracecmd_input *handle, struct input_files *input_files)
 {
 	struct handle_list *item;
+	const char *file = input_files ? input_files->file : input_file;
 
-	item = malloc(sizeof(*item));
+	item = calloc(1, sizeof(*item));
 	if (!item)
 		die("Failed ot allocate for %s", file);
-	memset(item, 0, sizeof(*item));
 	item->handle = handle;
-	if (file) {
+	if (input_files) {
 		item->file = file + strlen(file);
 		/* we want just the base name */
 		while (item->file >= file && *item->file != '/')
@@ -368,6 +375,8 @@ static void add_handle(struct tracecmd_input *handle, const char *file)
 		item->file++;
 		if (strlen(item->file) > max_file_size)
 			max_file_size = strlen(item->file);
+
+		item->input_file = input_files;
 	}
 	list_add_tail(&item->list, &handle_list);
 }
@@ -379,6 +388,7 @@ static void free_inputs(void)
 	while (!list_empty(&input_files)) {
 		item = container_of(input_files.next, struct input_files, list);
 		list_del(&item->list);
+		free_filter_strings(item->filter_str);
 		free(item);
 	}
 }
@@ -394,7 +404,7 @@ static void free_handles(void)
 	}
 }
 
-static void add_filter(const char *filter, int neg)
+static void add_filter(struct input_files *input_file, const char *filter, int neg)
 {
 	struct filter_str *ftr;
 
@@ -408,8 +418,13 @@ static void add_filter(const char *filter, int neg)
 	ftr->neg = neg;
 
 	/* must maintain order of command line */
-	*filter_next = ftr;
-	filter_next = &ftr->next;
+	if (input_file) {
+		*input_file->filter_str_next = ftr;
+		input_file->filter_str_next = &ftr->next;
+	} else {
+		*filter_next = ftr;
+		filter_next = &ftr->next;
+	}
 }
 
 static void __add_filter(struct pid_list **head, const char *arg)
@@ -467,7 +482,7 @@ static char *append_pid_filter(char *curr_filter, char *pid)
 	if (!curr_filter) {
 		filter = malloc(len);
 		if (!filter)
-			die("Failed to allocate for filter %s", curr_filter);
+			die("Failed to allocate pid filter");
 		sprintf(filter, ".*:" FILTER_FMT, pid, pid, pid);
 	} else {
 		curr_len = strlen(curr_filter);
@@ -519,7 +534,8 @@ static void convert_comm_filter(struct tracecmd_input *handle)
 	}
 }
 
-static void make_pid_filter(struct tracecmd_input *handle)
+static void make_pid_filter(struct tracecmd_input *handle,
+			    struct input_files *input_files)
 {
 	struct pid_list *list;
 	char *str = NULL;
@@ -534,7 +550,7 @@ static void make_pid_filter(struct tracecmd_input *handle)
 		str = append_pid_filter(str, list->pid);
 	}
 
-	add_filter(str, 0);
+	add_filter(input_files, str, 0);
 	free(str);
 
 	while (pid_list) {
@@ -546,53 +562,40 @@ static void make_pid_filter(struct tracecmd_input *handle)
 	}
 }
 
+static int __process_filters(struct tracecmd_input *handle,
+			     struct filter_str *filters)
+{
+	struct tracecmd_filter *trace_filter;
+
+	for (; filters; filters = filters->next) {
+		trace_filter = tracecmd_filter_add(handle,
+						   filters->filter,
+						   filters->neg);
+		if (!trace_filter)
+			die("Failed to create event filter: %s",
+			    filters->filter);
+	}
+
+	return !!filters;
+}
+
 static void process_filters(struct handle_list *handles)
 {
-	struct filter **filter_next = &handles->event_filters;
-	struct filter **filter_out_next = &handles->event_filter_out;
-	struct filter *event_filter;
-	struct filter_str *filter;
-	struct tep_handle *pevent;
-	char errstr[200];
-	int filters = 0;
-	int ret;
+	struct input_files *input_file = handles->input_file ?: last_input_file;
+	int added = 0;
 
-	pevent = tracecmd_get_tep(handles->handle);
+	make_pid_filter(handles->handle, input_file);
 
-	make_pid_filter(handles->handle);
+	/*
+	 * Order of filter processing matters. Apply the global filters
+	 * before file-specific ones.
+	 */
+	added += __process_filters(handles->handle, filter_strings);
+	if (input_file)
+		added += __process_filters(handles->handle,
+					   input_file->filter_str);
 
-	while (filter_strings) {
-		filter = filter_strings;
-		filter_strings = filter->next;
-
-		event_filter = malloc(sizeof(*event_filter));
-		if (!event_filter)
-			die("Failed to allocate for event filter");
-		event_filter->next = NULL;
-		event_filter->filter = tep_filter_alloc(pevent);
-		if (!event_filter->filter)
-			die("malloc");
-
-		ret = tep_filter_add_filter_str(event_filter->filter,
-						   filter->filter);
-		if (ret < 0) {
-			tep_strerror(pevent, ret, errstr, sizeof(errstr));
-			die("Error filtering: %s\n%s",
-			    filter->filter, errstr);
-		}
-
-		if (filter->neg) {
-			*filter_out_next = event_filter;
-			filter_out_next = &event_filter->next;
-		} else {
-			*filter_next = event_filter;
-			filter_next = &event_filter->next;
-		}
-		filters++;
-		free(filter->filter);
-		free(filter);
-	}
-	if (filters && test_filters_mode)
+	if (added && test_filters_mode)
 		exit(0);
 }
 
@@ -867,14 +870,13 @@ void trace_show_data(struct tracecmd_input *handle, struct tep_record *record)
 			TEP_PRINT_PID,
 			TEP_PRINT_CPU);
 
-	if (latency_format) {
-		if (raw_format)
-			trace_seq_printf(&s, "-0x%x",
-					 tep_data_flags(pevent, record));
-		else
-			tep_print_event(pevent, &s, record, "%s",
-					TEP_PRINT_LATENCY);
-	}
+	if (raw_format)
+		trace_seq_printf(&s, "-0x%x",
+				 tep_data_flags(pevent, record));
+	else
+		tep_print_event(pevent, &s, record,
+				latency_format ? "%s" : " %s",
+				TEP_PRINT_LATENCY);
 
 	tep_print_event(pevent, &s, record, tfmt, TEP_PRINT_TIME);
 
@@ -968,10 +970,8 @@ static void read_latency(struct tracecmd_input *handle)
 }
 
 static int
-test_filters(struct tep_handle *pevent, struct filter *event_filters,
-	     struct tep_record *record, int neg)
+test_filters(struct tep_handle *pevent, struct tep_record *record)
 {
-	int found = 0;
 	int ret = FILTER_NONE;
 	int flags;
 
@@ -981,19 +981,6 @@ test_filters(struct tep_handle *pevent, struct filter *event_filters,
 			return FILTER_MISS;
 		if (no_softirqs && (flags & TRACE_FLAG_SOFTIRQ))
 			return FILTER_MISS;
-	}
-
-	while (event_filters) {
-		ret = tep_filter_match(event_filters->filter, record);
-		switch (ret) {
-			case FILTER_NONE:
-			case FILTER_MATCH: 
-				found = 1;
-		}
-		/* We need to test all negative filters */
-		if (!neg && found)
-			break;
-		event_filters = event_filters->next;
 	}
 
 	return ret;
@@ -1008,170 +995,8 @@ struct stack_info {
 	struct stack_info	*next;
 	struct handle_list	*handles;
 	struct stack_info_cpu	*cpus;
-	int			stacktrace_id;
 	int			nr_cpus;
 };
-
-static int
-test_stacktrace(struct handle_list *handles, struct tep_record *record,
-		int last_printed)
-{
-	static struct stack_info *infos;
-	struct stack_info *info;
-	struct stack_info_cpu *cpu_info;
-	struct handle_list *h;
-	struct tracecmd_input *handle;
-	struct tep_handle *pevent;
-	struct tep_event *event;
-	static int init;
-	int ret;
-	int id;
-
-	if (!init) {
-		init = 1;
-
-		list_for_each_entry(h, &handle_list, list) {
-			info = malloc(sizeof(*info));
-			if (!info)
-				die("Failed to allocate handle");
-			info->handles = h;
-			info->nr_cpus = tracecmd_cpus(h->handle);
-
-			info->cpus = malloc(sizeof(*info->cpus) * info->nr_cpus);
-			if (!info->cpus)
-				die("Failed to allocate for %d cpus", info->nr_cpus);
-			memset(info->cpus, 0, sizeof(*info->cpus));
-
-			pevent = tracecmd_get_tep(h->handle);
-			event = tep_find_event_by_name(pevent, "ftrace",
-						       "kernel_stack");
-			if (event)
-				info->stacktrace_id = event->id;
-			else
-				info->stacktrace_id = 0;
-
-			info->next = infos;
-			infos = info;
-		}
-
-
-	}
-
-	handle = handles->handle;
-	pevent = tracecmd_get_tep(handle);
-
-	for (info = infos; info; info = info->next)
-		if (info->handles == handles)
-			break;
-
-	if (!info->stacktrace_id)
-		return 0;
-
-	cpu_info = &info->cpus[record->cpu];
-
-	id = tep_data_type(pevent, record);
-
-	/*
-	 * Print the stack trace if the previous event was printed.
-	 * But do not print the stack trace if it is explicitly
-	 * being filtered out.
-	 */
-	if (id == info->stacktrace_id) {
-		ret = test_filters(pevent, handles->event_filter_out, record, 1);
-		if (ret != FILTER_MATCH)
-			return cpu_info->last_printed;
-		return 0;
-	}
-
-	cpu_info->last_printed = last_printed;
-	return 0;
-}
-
-static struct tep_record *get_next_record(struct handle_list *handles)
-{
-	struct tep_record *record;
-	struct tep_handle *pevent;
-	int found = 0;
-	int cpu;
-	int ret;
-
-	if (handles->record)
-		return handles->record;
-
-	if (handles->done)
-		return NULL;
-
-	pevent = tracecmd_get_tep(handles->handle);
-
-	do {
-		if (filter_cpus) {
-			long long last_stamp = -1;
-			struct tep_record *precord;
-			int first_record = 1;
-			int next_cpu = -1;
-			int i;
-
-			for (i = 0; (cpu = filter_cpus[i]) >= 0; i++) {
-				precord = tracecmd_peek_data(handles->handle, cpu);
-				if (precord &&
-				    (first_record || precord->ts < last_stamp)) {
-					next_cpu = cpu;
-					last_stamp = precord->ts;
-					first_record = 0;
-				}
-			}
-			if (!first_record)
-				record = tracecmd_read_data(handles->handle, next_cpu);
-			else
-				record = NULL;
-		} else
-			record = tracecmd_read_next_data(handles->handle, &cpu);
-
-		if (record) {
-			ret = test_filters(pevent, handles->event_filters, record, 0);
-			switch (ret) {
-			case FILTER_NOEXIST:
-				/* Stack traces may still filter this */
-				if (stacktrace_id &&
-				    test_stacktrace(handles, record, 0))
-					found = 1;
-				else
-					tracecmd_free_record(record);
-				break;
-			case FILTER_NONE:
-			case FILTER_MATCH:
-				/* Test the negative filters (-v) */
-				ret = test_filters(pevent, handles->event_filter_out,
-						   record, 1);
-				if (ret != FILTER_MATCH) {
-					found = 1;
-					break;
-				}
-				/* fall through */
-			default:
-				tracecmd_free_record(record);
-			}
-		}
-	} while (record && !found);
-
-	if (record && stacktrace_id)
-		test_stacktrace(handles, record, 1);
-
-	handles->record = record;
-	if (!record)
-		handles->done = 1;
-
-	return record;
-}
-
-static void free_handle_record(struct handle_list *handles)
-{
-	if (!handles->record)
-		return;
-
-	tracecmd_free_record(handles->record);
-	handles->record = NULL;
-}
 
 static void print_handle_file(struct handle_list *handles)
 {
@@ -1184,17 +1009,157 @@ static void print_handle_file(struct handle_list *handles)
 		printf("%*s  ", max_file_size, "");
 }
 
-static void free_filters(struct filter *event_filter)
+static bool skip_record(struct handle_list *handles, struct tep_record *record, int cpu)
 {
-	struct filter *filter;
+	struct tep_handle *tep;
+	bool found = false;
+	int ret;
 
-	while (event_filter) {
-		filter = event_filter;
-		event_filter = filter->next;
+	tep = tracecmd_get_tep(handles->handle);
 
-		tep_filter_free(filter->filter);
-		free(filter);
+	if (filter_cpus) {
+		int i;
+
+		for (i = 0; filter_cpus[i] >= 0; i++) {
+			if (filter_cpus[i] == cpu) {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found)
+			return true;
+		found = false;
 	}
+
+	ret = test_filters(tep, record);
+	switch (ret) {
+	case FILTER_NOEXIST:
+		break;
+	case FILTER_NONE:
+	case FILTER_MATCH:
+		/* Test the negative filters (-v) */
+		ret = test_filters(tep, record);
+		if (ret != FILTER_MATCH) {
+			found = true;
+			break;
+		}
+	}
+
+	return !found;
+}
+
+struct kvm_cpu_map {
+	struct tracecmd_input		*guest_handle;
+	int				guest_vcpu;
+	int				host_pid;
+};
+
+static struct kvm_cpu_map *vcpu_maps;
+static int nr_vcpu_maps;
+
+static int cmp_map(const void *A, const void *B)
+{
+	const struct kvm_cpu_map *a = A;
+	const struct kvm_cpu_map *b = B;
+
+	if (a->host_pid < b->host_pid)
+		return -1;
+	return a->host_pid > b->host_pid;
+}
+
+static void map_vcpus(struct tracecmd_input **handles, int nr_handles)
+{
+	struct tracecmd_input *host_handle = handles[0];
+	unsigned long long traceid;
+	struct kvm_cpu_map *map;
+	const int *cpu_pids;
+	const char *name;
+	int vcpu_count;
+	int ret;
+	int i, k;
+
+	for (i = 1; i < nr_handles; i++) {
+		traceid = tracecmd_get_traceid(handles[i]);
+		ret = tracecmd_get_guest_cpumap(host_handle, traceid,
+						&name, &vcpu_count, &cpu_pids);
+		if (ret)
+			continue;
+		map = realloc(vcpu_maps, sizeof(*map) * (nr_vcpu_maps + vcpu_count));
+		if (!map)
+			die("Could not allocate vcpu maps");
+
+		vcpu_maps = map;
+		map += nr_vcpu_maps;
+		nr_vcpu_maps += vcpu_count;
+
+		for (k = 0; k < vcpu_count; k++) {
+			map[k].guest_handle = handles[i];
+			map[k].guest_vcpu = k;
+			map[k].host_pid = cpu_pids[k];
+		}
+	}
+	if (!vcpu_maps)
+		return;
+
+	qsort(vcpu_maps, nr_vcpu_maps, sizeof(*map), cmp_map);
+}
+
+
+const char *tep_plugin_kvm_get_func(struct tep_event *event,
+				    struct tep_record *record,
+				    unsigned long long *val)
+{
+	struct tep_handle *tep;
+	struct kvm_cpu_map *map;
+	struct kvm_cpu_map key;
+	unsigned long long rip = *val;
+	const char *func;
+	int pid;
+
+	if (!vcpu_maps || !nr_vcpu_maps)
+		return NULL;
+
+	/*
+	 * A kvm event is referencing an address of the guest.
+	 * get the PID of this event, and then find which guest
+	 * it belongs to. Then return the function name from that guest's
+	 * handle.
+	 */
+	pid = tep_data_pid(event->tep, record);
+
+	key.host_pid = pid;
+	map = bsearch(&key, vcpu_maps, nr_vcpu_maps, sizeof(*vcpu_maps), cmp_map);
+
+	if (!map)
+		return NULL;
+
+	tep = tracecmd_get_tep(map->guest_handle);
+	func = tep_find_function(tep, rip);
+	if (func)
+		*val = tep_find_function_address(tep, rip);
+	return func;
+}
+
+static int process_record(struct tracecmd_input *handle, struct tep_record *record,
+			  int cpu, void *data)
+{
+	struct handle_list *handles = tracecmd_get_private(handle);
+	unsigned long long *last_timestamp = data;
+
+	if (skip_record(handles, record, cpu))
+		return 0;
+
+	if (tscheck && *last_timestamp > record->ts) {
+		errno = 0;
+		warning("WARNING: Record on cpu %d went backwards: %lld to %lld delta: -%lld\n",
+			cpu, *last_timestamp, record->ts, *last_timestamp - record->ts);
+	}
+	*last_timestamp = record->ts;
+
+	print_handle_file(handles);
+	trace_show_data(handle, record);
+	return 0;
 }
 
 enum output_type {
@@ -1209,16 +1174,16 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 {
 	unsigned long long ts, first_ts;
 	struct handle_list *handles;
-	struct handle_list *last_handle;
-	struct tep_record *record;
-	struct tep_record *last_record;
-	struct tep_handle *pevent;
-	struct tep_event *event;
+	struct tracecmd_input **handle_array;
+	unsigned long long last_timestamp = 0;
+	int nr_handles = 0;
 	int first = 1;
 	int ret;
 
 	list_for_each_entry(handles, handle_list, list) {
 		int cpus;
+
+		nr_handles++;
 
 		if (!tracecmd_is_buffer_instance(handles->handle)) {
 			ret = tracecmd_init_data(handles->handle);
@@ -1227,9 +1192,8 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 		}
 		cpus = tracecmd_cpus(handles->handle);
 		handles->cpus = cpus;
-		handles->last_timestamp = calloc(cpus, sizeof(*handles->last_timestamp));
-		if (!handles->last_timestamp)
-			die("allocating timestamps");
+
+		process_filters(handles);
 
 		/* Don't process instances that we added here */
 		if (tracecmd_is_buffer_instance(handles->handle))
@@ -1268,12 +1232,6 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 			continue;
 		}
 
-		/* Find the kernel_stacktrace if available */
-		pevent = tracecmd_get_tep(handles->handle);
-		event = tep_find_event_by_name(pevent, "ftrace", "kernel_stack");
-		if (event)
-			stacktrace_id = event->id;
-
 		init_wakeup(handles->handle);
 		if (last_hook)
 			last_hook->next = tracecmd_hooks(handles->handle);
@@ -1282,14 +1240,16 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 		if (profile)
 			trace_init_profile(handles->handle, hooks, global);
 
-		process_filters(handles);
-
 		/* If this file has buffer instances, get the handles for them */
 		instances = tracecmd_buffer_instances(handles->handle);
 		if (instances) {
 			struct tracecmd_input *new_handle;
+			struct input_files *file_input;
+			const char *save_name;
 			const char *name;
 			int i;
+
+			file_input = handles->input_file;
 
 			for (i = 0; i < instances; i++) {
 				name = tracecmd_buffer_instance_name(handles->handle, i);
@@ -1300,7 +1260,16 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 					warning("could not retrieve handle %s", name);
 					continue;
 				}
-				add_handle(new_handle, name);
+				if (file_input) {
+					save_name = file_input->file;
+					file_input->file = name;
+				} else {
+					save_name = NULL;
+					file_input = add_input(name);
+				}
+				add_handle(new_handle, file_input);
+				if (save_name)
+					file_input->file = save_name;
 			}
 		}
 	}
@@ -1314,47 +1283,27 @@ static void read_data_info(struct list_head *handle_list, enum output_type otype
 		}
 	}
 
-	do {
-		last_handle = NULL;
-		last_record = NULL;
+	handle_array = calloc(nr_handles, sizeof(*handle_array));
+	if (!handle_array)
+		die("Could not allocate memory for handle list");
 
-		list_for_each_entry(handles, handle_list, list) {
-			record = get_next_record(handles);
-			if (!record)
-				continue;
-			if (!last_record ||
-			    (record && record->ts < last_record->ts)) {
-				last_record = record;
-				last_handle = handles;
-			}
-		}
-		if (last_record) {
-			int cpu = last_record->cpu;
-			if (cpu >= last_handle->cpus)
-				die("cpu %d greater than %d\n", cpu, last_handle->cpus);
-			if (tscheck &&
-			    last_handle->last_timestamp[cpu] > last_record->ts) {
-				errno = 0;
-				warning("WARNING: Record on cpu %d went backwards: %lld to %lld delta: -%lld\n",
-					cpu, last_handle->last_timestamp[cpu],
-					last_record->ts,
-					last_handle->last_timestamp[cpu] - last_record->ts);
-			}
-			last_handle->last_timestamp[cpu] = last_record->ts;
-			print_handle_file(last_handle);
-			trace_show_data(last_handle->handle, last_record);
-			free_handle_record(last_handle);
-		}
-	} while (last_record);
+	nr_handles = 0;
+	list_for_each_entry(handles, handle_list, list) {
+		tracecmd_set_private(handles->handle, handles);
+		handle_array[nr_handles++] = handles->handle;
+	}
+
+	map_vcpus(handle_array, nr_handles);
+
+	tracecmd_iterate_events_multi(handle_array, nr_handles,
+				      process_record, &last_timestamp);
+
+	free(handle_array);
 
 	if (profile)
 		do_trace_profile();
 
 	list_for_each_entry(handles, handle_list, list) {
-		free_filters(handles->event_filters);
-		free_filters(handles->event_filter_out);
-		free(handles->last_timestamp);
-
 		show_test(handles->handle);
 	}
 }
@@ -1507,6 +1456,19 @@ static void set_event_flags(struct tep_handle *pevent, struct event_str *list,
 	}
 }
 
+static void show_event_ts(struct tracecmd_input *handle,
+			  struct tep_record *record)
+{
+	const char *tfmt = time_format(handle, TIME_FMT_TS);
+	struct tep_handle *tep = tracecmd_get_tep(handle);
+	struct trace_seq s;
+
+	trace_seq_init(&s);
+	tep_print_event(tep, &s, record, tfmt, TEP_PRINT_TIME);
+	printf("%s", s.buffer);
+	trace_seq_destroy(&s);
+}
+
 static void add_hook(const char *arg)
 {
 	struct hook_list *hook;
@@ -1517,6 +1479,21 @@ static void add_hook(const char *arg)
 	hooks = hook;
 	if (!last_hook)
 		last_hook = hook;
+}
+
+static void add_first_input(const char *input_file, long long tsoffset)
+{
+	struct input_files *item;
+
+	/* Copy filter strings to this input file */
+	item = add_input(input_file);
+	item->filter_str = filter_strings;
+	if (filter_strings)
+		item->filter_str_next = filter_next;
+	else
+		item->filter_str_next = &item->filter_str;
+	/* Copy the tsoffset to this input file */
+	item->tsoffset = tsoffset;
 }
 
 enum {
@@ -1543,6 +1520,8 @@ enum {
 	OPT_events	= 254,
 	OPT_cpu		= 255,
 	OPT_cpus	= 256,
+	OPT_first	= 257,
+	OPT_last	= 258,
 };
 
 void trace_report (int argc, char **argv)
@@ -1571,6 +1550,8 @@ void trace_report (int argc, char **argv)
 	int show_version = 0;
 	int show_events = 0;
 	int show_cpus = 0;
+	int show_first = 0;
+	int show_last = 0;
 	int print_events = 0;
 	int nanosec = 0;
 	int no_date = 0;
@@ -1593,6 +1574,8 @@ void trace_report (int argc, char **argv)
 
 	signal(SIGINT, sig_end);
 
+	trace_set_loglevel(TEP_LOG_ERROR);
+
 	for (;;) {
 		int option_index = 0;
 		static struct option long_options[] = {
@@ -1601,6 +1584,7 @@ void trace_report (int argc, char **argv)
 			{"events", no_argument, NULL, OPT_events},
 			{"event", required_argument, NULL, OPT_event},
 			{"filter-test", no_argument, NULL, 'T'},
+			{"first-event", no_argument, NULL, OPT_first},
 			{"kallsyms", required_argument, NULL, OPT_kallsyms},
 			{"pid", required_argument, NULL, OPT_pid},
 			{"comm", required_argument, NULL, OPT_comm},
@@ -1610,6 +1594,7 @@ void trace_report (int argc, char **argv)
 			{"stat", no_argument, NULL, OPT_stat},
 			{"boundary", no_argument, NULL, OPT_boundary},
 			{"debug", no_argument, NULL, OPT_debug},
+			{"last-event", no_argument, NULL, OPT_last},
 			{"profile", no_argument, NULL, OPT_profile},
 			{"uname", no_argument, NULL, OPT_uname},
 			{"version", no_argument, NULL, OPT_version},
@@ -1635,18 +1620,15 @@ void trace_report (int argc, char **argv)
 			break;
 		case 'i':
 			if (input_file) {
-				if (!multi_inputs) {
-					add_input(input_file);
-					if (tsoffset)
-						last_input_file->tsoffset = tsoffset;
-				}
 				multi_inputs++;
 				add_input(optarg);
-			} else
+			} else {
 				input_file = optarg;
+				add_first_input(input_file, tsoffset);
+			}
 			break;
 		case 'F':
-			add_filter(optarg, neg);
+			add_filter(last_input_file, optarg, neg);
 			break;
 		case 'H':
 			add_hook(optarg);
@@ -1754,6 +1736,14 @@ void trace_report (int argc, char **argv)
 		case OPT_stat:
 			show_stat = 1;
 			break;
+		case OPT_first:
+			show_first = 1;
+			show_cpus = 1;
+			break;
+		case OPT_last:
+			show_last = 1;
+			show_cpus = 1;
+			break;
 		case OPT_boundary:
 			/* Debug to look at buffer breaks */
 			buffer_breaks = 1;
@@ -1815,15 +1805,18 @@ void trace_report (int argc, char **argv)
 		if (input_file)
 			usage(argv);
 		input_file = argv[optind + 1];
+		add_first_input(input_file, tsoffset);
+		for (int i = optind + 2; i < argc; i++) {
+			multi_inputs++;
+			add_input(argv[i]);
+		}
 	}
 
-	if (!input_file)
-		input_file = default_input_file;
-
 	if (!multi_inputs) {
-		add_input(input_file);
-		if (tsoffset)
-			last_input_file->tsoffset = tsoffset;
+		if (!input_file) {
+			input_file = default_input_file;
+			add_first_input(input_file, tsoffset);
+		}
 	} else if (show_wakeup)
 		die("Wakeup tracing can only be done on a single input file");
 
@@ -1833,7 +1826,7 @@ void trace_report (int argc, char **argv)
 			die("error reading header for %s", inputs->file);
 
 		/* If used with instances, top instance will have no tag */
-		add_handle(handle, multi_inputs ? inputs->file : NULL);
+		add_handle(handle, multi_inputs ? inputs : NULL);
 
 		if (no_date)
 			tracecmd_set_flag(handle, TRACECMD_FL_IGNORE_DATE);
@@ -1923,6 +1916,7 @@ void trace_report (int argc, char **argv)
 		}
 
 		if (show_cpus) {
+			struct tep_record *record;
 			int cpus;
 			int ret;
 			int i;
@@ -1935,8 +1929,23 @@ void trace_report (int argc, char **argv)
 			cpus = tracecmd_cpus(handle);
 			printf("List of CPUs in %s with data:\n", inputs->file);
 			for (i = 0; i < cpus; i++) {
-				if (tracecmd_read_cpu_first(handle, i))
-					printf("  %d\n", i);
+				if ((record = tracecmd_read_cpu_first(handle, i))) {
+					printf("  %d", i);
+					if (show_first) {
+						printf("\tFirst event:");
+						show_event_ts(handle, record);
+					}
+					if (show_last) {
+						tracecmd_free_record(record);
+						record = tracecmd_read_cpu_last(handle, i);
+						if (record) {
+							printf("\tLast event:");
+							show_event_ts(handle, record);
+						}
+					}
+					tracecmd_free_record(record);
+					printf("\n");
+				}
 			}
 			continue;
 		}

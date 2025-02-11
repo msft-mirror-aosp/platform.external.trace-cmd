@@ -22,6 +22,8 @@
 #include "trace-local.h"
 #include "trace-msg.h"
 
+#define GUEST_NAME	"::GUEST::"
+
 #define dprint(fmt, ...)	tracecmd_debug(fmt, ##__VA_ARGS__)
 
 static void make_vsocks(int nr, int *fds, unsigned int *ports)
@@ -122,17 +124,46 @@ static void trace_print_connection(int fd, const char *network)
 		tracecmd_debug("Could not print connection fd:%d\n", fd);
 }
 
-static void agent_handle(int sd, int nr_cpus, int page_size, const char *network)
+static int wait_for_connection(int fd)
+{
+	int sd;
+
+	if (fd < 0)
+		return -1;
+
+	while (true) {
+		tracecmd_debug("Listening on fd:%d\n", fd);
+		sd = accept(fd, NULL, NULL);
+		tracecmd_debug("Accepted fd:%d\n", sd);
+		if (sd < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		break;
+	}
+	close(fd);
+	return sd;
+}
+
+static void agent_handle(int sd, int nr_cpus, int page_size,
+			 int cid, int rcid, const char *network)
 {
 	struct tracecmd_tsync_protos *tsync_protos = NULL;
 	struct tracecmd_time_sync *tsync = NULL;
 	struct tracecmd_msg_handle *msg_handle;
-	char *tsync_proto = NULL;
+	const char *tsync_proto = NULL;
+	struct trace_guest *guest;
+	unsigned long long peer_trace_id;
 	unsigned long long trace_id;
+	unsigned long flags = rcid >= 0 ? TRACECMD_MSG_FL_PROXY : 0;
+	enum tracecmd_time_sync_role tsync_role = TRACECMD_TIME_SYNC_ROLE_GUEST;
 	unsigned int remote_id;
 	unsigned int local_id;
 	unsigned int tsync_port = 0;
 	unsigned int *ports;
+	unsigned int client_cpus = 0;
+	unsigned int guests = 0;
 	char **argv = NULL;
 	int argc = 0;
 	bool use_fifos;
@@ -145,22 +176,38 @@ static void agent_handle(int sd, int nr_cpus, int page_size, const char *network
 	if (!fds || !ports)
 		die("Failed to allocate memory");
 
-	msg_handle = tracecmd_msg_handle_alloc(sd, 0);
+	msg_handle = tracecmd_msg_handle_alloc(sd, flags);
 	if (!msg_handle)
 		die("Failed to allocate message handle");
 
-	ret = tracecmd_msg_recv_trace_req(msg_handle, &argc, &argv,
-					  &use_fifos, &trace_id,
-					  &tsync_protos);
+	if (rcid >= 0) {
+		tsync_role = TRACECMD_TIME_SYNC_ROLE_HOST;
+		ret = tracecmd_msg_recv_trace_proxy(msg_handle, &argc, &argv,
+						    &use_fifos, &peer_trace_id,
+						    &tsync_protos,
+						    &client_cpus,
+						    &guests);
+		/* Update the guests peer_trace_id */
+		guest = trace_get_guest(rcid, NULL);
+		if (guest)
+			guest->trace_id = peer_trace_id;
+	} else {
+		ret = tracecmd_msg_recv_trace_req(msg_handle, &argc, &argv,
+						  &use_fifos, &peer_trace_id,
+						  &tsync_protos);
+	}
 	if (ret < 0)
 		die("Failed to receive trace request");
+
+	tsync_proto = tracecmd_tsync_get_proto(tsync_protos, get_clock(argc, argv),
+					       tsync_role);
 
 	if (use_fifos && open_agent_fifos(nr_cpus, fds))
 		use_fifos = false;
 
 	if (!use_fifos)
 		make_sockets(nr_cpus, fds, ports, network);
-	if (tsync_protos && tsync_protos->names) {
+	if (tsync_proto) {
 		if (network) {
 			/* For now just use something */
 			remote_id = 2;
@@ -183,18 +230,6 @@ static void agent_handle(int sd, int nr_cpus, int page_size, const char *network
 				fd = -1;
 			}
 		}
-		if (fd >= 0) {
-			tsync = tracecmd_tsync_with_host(fd, tsync_protos,
-							 get_clock(argc, argv),
-							 remote_id, local_id);
-		}
-		if (tsync) {
-			tracecmd_tsync_get_selected_proto(tsync, &tsync_proto);
-		} else {
-			warning("Failed to negotiate timestamps synchronization with the host");
-			if (fd >= 0)
-				close(fd);
-		}
 	}
 	trace_id = tracecmd_generate_traceid();
 	ret = tracecmd_msg_send_trace_resp(msg_handle, nr_cpus, page_size,
@@ -203,11 +238,28 @@ static void agent_handle(int sd, int nr_cpus, int page_size, const char *network
 	if (ret < 0)
 		die("Failed to send trace response");
 
+	if (tsync_proto) {
+		fd = wait_for_connection(fd);
+
+		if (rcid >= 0) {
+			tsync = trace_tsync_as_host(fd, trace_id, 0, rcid,
+						    client_cpus, tsync_proto,
+						    get_clock(argc, argv));
+		} else {
+			tsync = trace_tsync_as_guest(fd, tsync_proto,
+						     get_clock(argc, argv),
+						     remote_id, local_id);
+		}
+		if (!tsync)
+			close(fd);
+	}
+
 	trace_record_agent(msg_handle, nr_cpus, fds, argc, argv,
-			   use_fifos, trace_id, network);
+			   use_fifos, tsync, trace_id, rcid, network);
 
 	if (tsync) {
-		tracecmd_tsync_with_host_stop(tsync);
+		if (rcid < 0)
+			tracecmd_tsync_with_host_stop(tsync);
 		tracecmd_tsync_free(tsync);
 	}
 
@@ -249,14 +301,15 @@ static pid_t do_fork()
 	return fork();
 }
 
-static void agent_serve(unsigned int port, bool do_daemon, const char *network)
+static void agent_serve(unsigned int port, bool do_daemon, int proxy_id,
+			const char *network)
 {
 	struct sockaddr_storage net_addr;
 	struct sockaddr *addr = NULL;
 	socklen_t *addr_len_p = NULL;
 	socklen_t addr_len = sizeof(net_addr);
 	int sd, cd, nr_cpus;
-	unsigned int cid;
+	unsigned int cid = -1, rcid = -1;
 	pid_t pid;
 
 	signal(SIGCHLD, handle_sigchld);
@@ -295,6 +348,21 @@ static void agent_serve(unsigned int port, bool do_daemon, const char *network)
 				continue;
 			die("accept");
 		}
+		if (proxy_id >= 0) {
+			/* Only works with vsockets */
+			if (get_vsocket_params(cd, NULL, &rcid) < 0) {
+				dprint("Failed to find connected cid");
+				close(cd);
+				continue;
+			}
+			if (rcid != proxy_id) {
+				dprint("Cid %d does not match expected cid %d\n",
+				       rcid, proxy_id);
+				close(cd);
+				continue;
+			}
+		}
+
 		if (tracecmd_get_debug())
 			trace_print_connection(cd, network);
 
@@ -311,7 +379,7 @@ static void agent_serve(unsigned int port, bool do_daemon, const char *network)
 		if (pid == 0) {
 			close(sd);
 			signal(SIGCHLD, SIG_DFL);
-			agent_handle(cd, nr_cpus, page_size, network);
+			agent_handle(cd, nr_cpus, page_size, cid, rcid, network);
 		}
 		if (pid > 0)
 			handler_pid = pid;
@@ -323,14 +391,17 @@ busy:
 
 enum {
 	OPT_verbose	= 254,
-	DO_DEBUG	= 255
+	OPT_debug	= 255,
+	OPT_notimeout	= 256,
 };
 
 void trace_agent(int argc, char **argv)
 {
+	struct trace_guest *guest;
 	bool do_daemon = false;
 	unsigned int port = TRACE_AGENT_DEFAULT_PORT;
 	const char *network = NULL;
+	int proxy_id = -1;
 
 	if (argc < 2)
 		usage(argv);
@@ -343,12 +414,13 @@ void trace_agent(int argc, char **argv)
 		static struct option long_options[] = {
 			{"port", required_argument, NULL, 'p'},
 			{"help", no_argument, NULL, '?'},
-			{"debug", no_argument, NULL, DO_DEBUG},
+			{"debug", no_argument, NULL, OPT_debug},
+			{"notimeout", no_argument, NULL, OPT_notimeout},
 			{"verbose", optional_argument, NULL, OPT_verbose},
 			{NULL, 0, NULL, 0}
 		};
 
-		c = getopt_long(argc-1, argv+1, "+hp:DN:",
+		c = getopt_long(argc-1, argv+1, "+hp:DN:P:",
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -361,12 +433,25 @@ void trace_agent(int argc, char **argv)
 			break;
 		case 'p':
 			port = atoi(optarg);
+			if (proxy_id >= 0)
+				die("-N cannot be used with -P");
 			break;
 		case 'D':
 			do_daemon = true;
 			break;
-		case DO_DEBUG:
+		case 'P':
+			proxy_id = atoi(optarg);
+
+			guest = trace_get_guest(proxy_id, GUEST_NAME);
+			if (!guest)
+				die("Failed to allocate guest instance");
+
+			break;
+		case OPT_debug:
 			tracecmd_set_debug(true);
+			break;
+		case OPT_notimeout:
+			tracecmd_set_notimeout(true);
 			break;
 		case OPT_verbose:
 			if (trace_set_verbose(optarg) < 0)
@@ -380,5 +465,5 @@ void trace_agent(int argc, char **argv)
 	if (optind < argc-1)
 		usage(argv);
 
-	agent_serve(port, do_daemon, network);
+	agent_serve(port, do_daemon, proxy_id, network);
 }

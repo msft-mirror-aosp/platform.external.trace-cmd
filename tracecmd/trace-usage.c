@@ -19,7 +19,8 @@ static struct usage_help usage_help[] = {
 		"record a trace into a trace.dat file",
 		" %s record [-v][-e event [-f filter]][-p plugin][-F][-d][-D][-o file] \\\n"
 		"           [-q][-s usecs][-O option ][-l func][-g func][-n func] \\\n"
-		"           [-P pid][-N host:port][-t][-r prio][-b size][-B buf][command ...]\n"
+		"           [-P pid][-N host:port][-t][-r prio][-b size][-B buf] \\\n"
+		"           [--proxy vsock][command ...]\n"
 		"           [-m max][-C clock]\n"
 		"          -e run command with event enabled\n"
 		"          -f filter for previous -e event\n"
@@ -53,6 +54,8 @@ static struct usage_help usage_help[] = {
 		"          -q print no output to the screen\n"
 		"          -G when profiling, set soft and hard irqs as global\n"
 		"          --quiet print no output to the screen\n"
+		"          --temp specify a directory to store the temp files used to create trace.dat\n"
+		"          --subbuf-size to specify the sub-buffer size in kilobytes\n"
 		"          --module filter module name\n"
 		"          --by-comm used with --profile, merge events for related comms\n"
 		"          --profile enable tracing options needed for report --profile\n"
@@ -77,6 +80,11 @@ static struct usage_help usage_help[] = {
 		"                            none - do not compress the trace file\n"
 		"                            name - the name of the desired compression algorithms\n"
 		"                        available algorithms can be listed with trace-cmd list -c\n"
+		"          --proxy vsocket to reach the agent. Acts the same as -A (for an agent)\n"
+		"              but will send the proxy connection to the agent.\n"
+		"          --daemonize run trace-cmd in the background as a daemon after recording has started.\n"
+		"                      creates a pidfile at /var/run/trace-cmd-record.pid with the pid of trace-cmd\n"
+		"                      during the recording.\n"
 	},
 	{
 		"set",
@@ -173,6 +181,8 @@ static struct usage_help usage_help[] = {
 		"          --current_tracer\n"
 		"          --buffer_size (for buffer_size_kb)\n"
 		"          --buffer_total_size (for buffer_total_size_kb)\n"
+		"          --buffer_subbuf_size (for buffer_subbuf_size_kb)\n"
+		"          --buffer_percent (for buffer_percent)\n"
 		"          --ftrace_filter (for set_ftrace_filter)\n"
 		"          --ftrace_notrace (for set_ftrace_notrace)\n"
 		"          --ftrace_pid (for set_ftrace_pid)\n"
@@ -230,6 +240,8 @@ static struct usage_help usage_help[] = {
 		"          --cpu <cpu1,cpu2,...> - filter events according to the given cpu list.\n"
 		"                                  A range of CPUs can be specified using 'cpuX-cpuY' notation.\n"
 		"          --cpus - List the CPUs that have content in it then exit.\n"
+		"          --first-event - Show the timestamp of the first event for all CPUs.\n"
+		"          --last-event - Show the timestamp of the last event for all CPUs.\n"
 		"          --check-events return whether all event formats can be parsed\n"
 		"          --stat - show the buffer stats that were reported at the end of the record.\n"
 		"          --uname - show uname of the record, if it was saved\n"
@@ -299,6 +311,13 @@ static struct usage_help usage_help[] = {
 		"          -u n  split file up by n microseconds\n"
 		"          -e n  split file up by n events\n"
 		"          -p n  split file up by n pages\n"
+		"          -C n  select CPU n\n"
+		"          -B buffer  keep buffer in resulting .dat file\n"
+		"                     Use -t to promote the buffer to the top instance.\n"
+		"          -t    promote preceding buffer to the top instance.\n"
+		"                Must follow -B.\n"
+		"          --top keep top buffer in resulting .dat file.\n"
+		"          -b    new name of the top instance. Must follow --top.\n"
 		"          -r    repeat from start to end\n"
 		"          -c    per cpu, that is -p 2 will be 2 pages for each CPU\n"
 		"          if option is specified, it will split the file\n"
@@ -328,13 +347,15 @@ static struct usage_help usage_help[] = {
 	{
 		"agent",
 		"listen on a vsocket for trace clients",
-		" %s agent -p port[-D]\n"
+		" %s agent -p port[-D][-N IP][-P cid]\n"
 		"          Creates a vsocket to listen for clients.\n"
 		"          -N Connect to IP via TCP instead of vsockets\n"
 		"             *** Insecure setting, only use on a trusted network ***\n"
 		"             ***   Only use if the client is totally trusted.    ***\n"
 		"          -p port number to listen on.\n"
 		"          -D run in daemon mode.\n"
+		"          -P Also act as a proxy server, with a single client denoted\n"
+		"             by a context ID (cid).\n"
 		"          --verbose 'level' Set the desired log level\n"
 	},
 	{
@@ -422,6 +443,15 @@ static struct usage_help usage_help[] = {
 		"          --verbose 'level' Set the desired log level\n"
 	},
 	{
+		"attach",
+		"Attach a host and guest trace.dat file",
+		" %s attach [options] host_file guest_file vcpu_pid,...\n"
+		"          -s  offset,scale,fraction[,timestamp] conversion to sync guest timestamp\n"
+		"          host_file The trace.dat file from the host\n"
+		"          guest_file The trace.dat file from the guest\n"
+		"          vcpu_pid list of process ids from the host that represent the vCPUs of the guest\n"
+	},
+	{
 		"convert",
 		"convert trace file to different version",
 		" %s convert [options]\n"
@@ -433,7 +463,25 @@ static struct usage_help usage_help[] = {
 		"                            any  - auto select the best available compression algorithm\n"
 		"                            none - do not compress the trace file\n"
 		"                            name - the name of the desired compression algorithms\n"
-		"                        available algorithms can be listed with trace-cmd list -c\n"	},
+		"                        available algorithms can be listed with trace-cmd list -c\n"
+	},
+	{
+		"sqlhist",
+		"Run a SQL like query to create histogram or synthetic events (see man tracefs_sql(3))\n",
+		"%s sql [-n name][-e][-s][-S fields][-m var][-c var][-T][-t dir][-f file | 'sql-command-line']\n"
+		"  -n name - name of synthetic event 'Anonymous' if left off\n"
+		"  -t dir - use dir instead of /sys/kernel/tracing\n"
+		"  -e - execute the commands to create the synthetic event\n"
+		"  -m - trigger the action when var is a new max.\n"
+		"  -c - trigger the action when var changes.\n"
+		"  -s - used with -m or -c to do a snapshot of the tracing buffer\n"
+		"  -S - used with -m or -c to save fields of the end event (comma deliminated)\n"
+		"  -T - used with -m or -c to do both a snapshot and a trace\n"
+		"  -f file - read sql lines from file otherwise from the command line\n"
+		"	    if file is '-' then read from standard input.\n\n"
+		" See man tracefs_sql(3) for sql-command-line\n"
+	},
+
 	{
 		NULL, NULL, NULL
 	}
