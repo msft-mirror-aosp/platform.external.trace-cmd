@@ -37,8 +37,11 @@ TRACE_CMD_OBJS += trace-dump.o
 TRACE_CMD_OBJS += trace-clear.o
 TRACE_CMD_OBJS += trace-vm.o
 TRACE_CMD_OBJS += trace-convert.o
+TRACE_CMD_OBJS += trace-attach.o
 TRACE_CMD_OBJS += trace-agent.o
+TRACE_CMD_OBJS += trace-tsync.o
 TRACE_CMD_OBJS += trace-setup-guest.o
+TRACE_CMD_OBJS += trace-sqlhist.o
 ifeq ($(VSOCK_DEFINED), 1)
 TRACE_CMD_OBJS += trace-vsock.o
 endif
@@ -48,13 +51,12 @@ ALL_OBJS := $(TRACE_CMD_OBJS:%.o=$(bdir)/%.o)
 all_objs := $(sort $(ALL_OBJS))
 all_deps := $(all_objs:$(bdir)/%.o=$(bdir)/.%.d)
 
-CONFIG_INCLUDES =
-CONFIG_LIBS	= -lrt -lpthread $(TRACE_LIBS) $(LIBZSTD_LDLAGS)
-CONFIG_FLAGS	=
+LPTHREAD ?= -lpthread
+LRT ?= -lrt
 
-ifeq ($(ZLIB_INSTALLED), 1)
-CONFIG_LIBS += -lz
-endif
+CONFIG_INCLUDES =
+CONFIG_LIBS	= $(LRT) $(LPTHREAD) $(TRACE_LIBS) $(ZLIB_LDLAGS) $(LIBZSTD_LDLAGS)
+CONFIG_FLAGS	=
 
 all: $(TARGETS)
 

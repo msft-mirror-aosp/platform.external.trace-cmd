@@ -11,16 +11,20 @@
 #include "trace-local.h"
 
 enum {
-	OPT_tracing_on			= 255,
-	OPT_current_tracer		= 254,
-	OPT_buffer_size_kb		= 253,
-	OPT_buffer_total_size_kb	= 252,
-	OPT_ftrace_filter		= 251,
-	OPT_ftrace_notrace		= 250,
-	OPT_ftrace_pid			= 249,
-	OPT_graph_function		= 248,
-	OPT_graph_notrace		= 247,
-	OPT_cpumask			= 246,
+	OPT_cpumask			= 240,
+	OPT_graph_notrace,
+	OPT_graph_function,
+	OPT_ftrace_pid,
+	OPT_ftrace_notrace,
+	OPT_ftrace_filter,
+	OPT_buffer_subbuf_size_kb,
+	OPT_buffer_total_size_kb,
+	OPT_buffer_size_kb,
+	OPT_buffer_percent,
+	OPT_current_tracer,
+	OPT_tracing_on,
+	OPT_hist,
+	OPT_trigger,
 };
 
 void trace_show(int argc, char **argv)
@@ -29,6 +33,8 @@ void trace_show(int argc, char **argv)
 	const char *file = "trace";
 	const char *cpu = NULL;
 	struct buffer_instance *instance = &top_instance;
+	char *hist = NULL;
+	char *trigger = NULL;
 	char cpu_path[128];
 	char *path;
 	int snap = 0;
@@ -38,10 +44,14 @@ void trace_show(int argc, char **argv)
 	int stop = 0;
 	int c;
 	static struct option long_options[] = {
+		{"hist", required_argument, NULL, OPT_hist},
+		{"trigger", required_argument, NULL, OPT_trigger},
 		{"tracing_on", no_argument, NULL, OPT_tracing_on},
 		{"current_tracer", no_argument, NULL, OPT_current_tracer},
 		{"buffer_size", no_argument, NULL, OPT_buffer_size_kb},
 		{"buffer_total_size", no_argument, NULL, OPT_buffer_total_size_kb},
+		{"buffer_subbuf_size", no_argument, NULL, OPT_buffer_subbuf_size_kb},
+		{"buffer_percent", no_argument, NULL, OPT_buffer_percent},
 		{"ftrace_filter", no_argument, NULL, OPT_ftrace_filter},
 		{"ftrace_notrace", no_argument, NULL, OPT_ftrace_notrace},
 		{"ftrace_pid", no_argument, NULL, OPT_ftrace_pid},
@@ -86,6 +96,13 @@ void trace_show(int argc, char **argv)
 			if (snap)
 				die("Can not have -s and -p together");
 			break;
+		case OPT_hist:
+			hist = optarg;
+			break;
+		case OPT_trigger:
+			trigger = optarg;
+			break;
+
 		case OPT_tracing_on:
 			show_instance_file(instance, "tracing_on");
 			stop = 1;
@@ -100,6 +117,14 @@ void trace_show(int argc, char **argv)
 			break;
 		case OPT_buffer_total_size_kb:
 			show_instance_file(instance, "buffer_total_size_kb");
+			stop = 1;
+			break;
+		case OPT_buffer_subbuf_size_kb:
+			show_instance_file(instance, "buffer_subbuf_size_kb");
+			stop = 1;
+			break;
+		case OPT_buffer_percent:
+			show_instance_file(instance, "buffer_percent");
 			stop = 1;
 			break;
 		case OPT_ftrace_filter:
@@ -136,6 +161,44 @@ void trace_show(int argc, char **argv)
 		file = "trace_pipe";
 	else if (snap)
 		file = "snapshot";
+
+	if (hist || trigger) {
+		char **systems = NULL;
+		char *system = NULL;
+		char *event = hist ? hist : trigger;
+		char *file = hist ? "hist" : "trigger";
+		char *p;
+
+		if ((p = strstr(event, ":"))) {
+			system = event;
+			event = p + 1;
+			*p = '\0';
+		}
+
+		if (!system) {
+			systems = tracefs_event_systems(NULL);
+
+			for (int i = 0; systems && systems[i]; i++) {
+				system = systems[i];
+				if (tracefs_event_file_exists(instance->tracefs,
+							      system, event, file))
+					break;
+			}
+			if (!system)
+				die("Could not find system of event %s",
+				    event);
+		}
+
+		path = tracefs_event_file_read(instance->tracefs,
+					       system, event, file, NULL);
+		tracefs_list_free(systems);
+		if (!path)
+			die("Could not find hist for %s%s%s",
+			    system ? system : "", system ? ":":"", event);
+		printf("%s\n", path);
+		free(path);
+		exit(0);
+	}
 
 	if (cpu) {
 		char *endptr;

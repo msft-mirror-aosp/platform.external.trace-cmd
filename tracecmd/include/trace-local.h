@@ -11,6 +11,8 @@
 #include <ctype.h>	/* for isdigit() */
 #include <errno.h>
 #include <limits.h>
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 
 #include "trace-cmd-private.h"
 #include "event-utils.h"
@@ -40,6 +42,7 @@ void usage(char **argv);
 extern int silence_warnings;
 extern int show_status;
 
+void trace_set_loglevel(int level);
 int trace_set_verbose(char *level);
 
 enum port_type {
@@ -117,12 +120,17 @@ void trace_usage(int argc, char **argv);
 
 void trace_dump(int argc, char **argv);
 
+void trace_attach(int argc, char **argv);
+
 void trace_convert(int argc, char **argv);
+
+void trace_sqlhist (int argc, char **argv);
 
 int trace_record_agent(struct tracecmd_msg_handle *msg_handle,
 		       int cpus, int *fds,
-		       int argc, char **argv, bool use_fifos,
-		       unsigned long long trace_id, const char *host);
+		       int argc, char **argv,
+		       bool use_fifos, struct tracecmd_time_sync *tsync,
+		       unsigned long long trace_id, int rcid, const char *host);
 
 struct hook_list;
 
@@ -135,7 +143,7 @@ struct tracecmd_input *
 trace_stream_init(struct buffer_instance *instance, int cpu, int fd, int cpus,
 		  struct hook_list *hooks,
 		  tracecmd_handle_init_func handle_init, int global);
-int trace_stream_read(struct pid_record_data *pids, int nr_pids, struct timeval *tv);
+int trace_stream_read(struct pid_record_data *pids, int nr_pids, long sleep_us);
 
 void trace_show_data(struct tracecmd_input *handle, struct tep_record *record);
 
@@ -190,6 +198,7 @@ enum buffer_instance_flags {
 	BUFFER_FL_HAS_CLOCK	= 1 << 4,
 	BUFFER_FL_TSC2NSEC	= 1 << 5,
 	BUFFER_FL_NETWORK	= 1 << 6,
+	BUFFER_FL_PROXY		= 1 << 7,
 };
 
 struct func_list {
@@ -230,6 +239,8 @@ struct buffer_instance {
 	unsigned long long	trace_id;
 	char			*cpumask;
 	char			*output_file;
+	const char		*temp_dir;
+	char			*temp_file;
 	struct event_list	*events;
 	struct event_list	**event_next;
 	bool			delete;
@@ -277,7 +288,12 @@ struct buffer_instance {
 	int			tracing_on_init_val;
 	int			tracing_on_fd;
 	int			buffer_size;
+	int			old_buffer_size;
+	int			subbuf_size;
+	int			old_subbuf_size;
 	int			cpu_count;
+
+	int			proxy_fd;
 
 	int			argc;
 	char			**argv;
@@ -305,7 +321,11 @@ extern struct buffer_instance *first_instance;
 
 #define is_agent(instance)	((instance)->flags & BUFFER_FL_AGENT)
 #define is_guest(instance)	((instance)->flags & BUFFER_FL_GUEST)
+#define is_proxy(instance)	((instance)->flags & BUFFER_FL_PROXY)
 #define is_network(instance)	((instance)->flags & BUFFER_FL_NETWORK)
+#define is_proxy_server(instance)					\
+	((instance)->msg_handle &&					\
+	 (instance)->msg_handle->flags & TRACECMD_MSG_FL_PROXY)
 
 #define START_PORT_SEARCH 1500
 #define MAX_PORT_SEARCH 6000
@@ -328,6 +348,7 @@ void show_options(const char *prefix, struct buffer_instance *buffer);
 struct trace_guest {
 	struct tracefs_instance *instance;
 	char *name;
+	unsigned long long trace_id;
 	int cid;
 	int pid;
 	int cpu_max;
@@ -339,6 +360,19 @@ bool trace_have_guests_pid(void);
 void read_qemu_guests(void);
 int get_guest_pid(unsigned int guest_cid);
 int get_guest_vcpu_pid(unsigned int guest_cid, unsigned int guest_vcpu);
+void trace_add_guest_info(struct tracecmd_output *handle, struct buffer_instance *instance);
+
+struct tracecmd_time_sync *
+trace_tsync_as_host(int fd, unsigned long long trace_id,
+		    int loop_interval, int guest_id,
+		    int guest_cpus, const char *proto_name,
+		    const char *clock);
+
+struct tracecmd_time_sync *
+trace_tsync_as_guest(int fd, const char *tsync_proto, const char *clock,
+	       unsigned int remote_id, unsigned int local_id);
+
+char *strparse(char *str, char delim, char **save);
 
 /* moved from trace-cmd.h */
 void tracecmd_remove_instances(void);
@@ -433,5 +467,17 @@ static inline bool is_digits(const char *s)
 }
 
 bool trace_tsc2nsec_is_supported(void);
+
+void make_pid_name(char *buf, const char *pidfile_basename);
+void remove_pid_file(const char *pidfile_basename);
+void make_pid_file(const char *pidfile_basename);
+
+static inline void set_tcp_no_delay(int sockfd, int socktype)
+{
+	int flag = 1;
+
+	if (socktype == SOCK_STREAM)
+		setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+}
 
 #endif /* __TRACE_LOCAL_H */
