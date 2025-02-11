@@ -129,38 +129,50 @@ cc_library {
     c_std: "gnu99",
 }
 
+tracecmd_cflags = [
+    "-D_GNU_SOURCE",
+    "-DNO_AUDIT",
+    "-DVSOCK",
+    // strstrip() is defined in libtracefs too; change our name to avoid
+    // duplicate symbols when statically linking.
+    "-Dstrstrip=strstrip_trace",
+    "-Wno-unused-parameter",
+    "-Wno-macro-redefined",
+    "-Wno-visibility",
+    "-Wno-pointer-arith",
+]
+
+tracecmd_includes = [
+    "lib/trace-cmd/include/private",
+    "include/trace-cmd",
+    "tracecmd/include",
+    "include",
+]
+
+tracecmd_libs = [
+    "libtraceevent",
+    "libtracecmd",
+    "libtracefs",
+]
+
 cc_binary {
     name: "trace-cmd",
+    vendor: true,
 
-    local_include_dirs: [
-        "lib/trace-cmd/include/private",
-        "include/trace-cmd",
-        "tracecmd/include",
-        "include",
-    ],
-
+    local_include_dirs: tracecmd_includes,
     srcs: ["tracecmd/*.c"],
+    static_libs: tracecmd_libs,
+    cflags: tracecmd_cflags,
+    c_std: "gnu99",
+}
 
-    static_libs: [
-        "libtraceevent",
-        "libtracecmd",
-        "libtracefs",
-    ],
+cc_binary {
+    name: "trace-cmd_static",
 
+    local_include_dirs: tracecmd_includes,
+    srcs: ["tracecmd/*.c"],
+    static_libs: tracecmd_libs,
     static_executable: true,
-
-    cflags: [
-        "-D_GNU_SOURCE",
-        "-DNO_AUDIT",
-        "-DVSOCK",
-        // strstrip() is defined in libtracefs too; change our name to avoid
-        // duplicate symbols when statically linking.
-        "-Dstrstrip=strstrip_trace",
-        "-Wno-unused-parameter",
-        "-Wno-macro-redefined",
-        "-Wno-visibility",
-        "-Wno-pointer-arith",
-    ],
-
+    cflags: tracecmd_cflags,
     c_std: "gnu99",
 }
