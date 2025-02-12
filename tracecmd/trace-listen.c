@@ -3,7 +3,6 @@
  * Copyright (C) 2009, 2010 Red Hat Inc, Steven Rostedt <srostedt@redhat.com>
  *
  */
-#define _LARGEFILE64_SOURCE
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +34,8 @@
 
 #define VAR_RUN_DIR		VAR_DIR_Q(VAR_DIR) "/run"
 
+#define LISTEN_PIDFILE		"trace-cmd-net.pid"
+
 static char *default_output_dir = ".";
 static char *output_dir;
 static char *default_output_file = "trace";
@@ -53,7 +54,8 @@ static bool done;
 #define pdie(fmt, ...)					\
 	do {						\
 		tracecmd_plog_error(fmt, ##__VA_ARGS__);\
-		remove_pid_file();			\
+		if (do_daemon)				\
+			remove_pid_file(LISTEN_PIDFILE);\
 		exit(-1);				\
 	} while (0)
 
@@ -127,21 +129,16 @@ static void finish(int sig)
 	done = true;
 }
 
-static void make_pid_name(int mode, char *buf)
+void make_pid_name(char *buf, const char *pidfile_basename)
 {
-	snprintf(buf, PATH_MAX, VAR_RUN_DIR "/trace-cmd-net.pid");
+	snprintf(buf, PATH_MAX, VAR_RUN_DIR "/%s", pidfile_basename);
 }
 
-static void remove_pid_file(void)
+void remove_pid_file(const char *pidfile_basename)
 {
 	char buf[PATH_MAX];
-	int mode = do_daemon;
 
-	if (!do_daemon)
-		return;
-
-	make_pid_name(mode, buf);
-
+	make_pid_name(buf, pidfile_basename);
 	unlink(buf);
 }
 
@@ -271,6 +268,7 @@ int trace_net_make(int port, enum port_type type)
 		if (sd < 0)
 			continue;
 
+		set_tcp_no_delay(sd, rp->ai_socktype);
 		if (bind(sd, rp->ai_addr, rp->ai_addrlen) == 0)
 			break;
 
@@ -455,12 +453,14 @@ static int communicate_with_client(struct tracecmd_msg_handle *msg_handle)
 				goto out;
 
 			ret = -EIO;
+			t = size;
+			s = 0;
 			do {
-				t = size;
-				s = 0;
 				s = read(fd, option+s, t);
-				if (s <= 0)
+				if (s <= 0) {
+					free(option);
 					goto out;
+				}
 				t -= s;
 				s = size - t;
 			} while (t);
@@ -699,8 +699,10 @@ static int process_client(struct tracecmd_msg_handle *msg_handle,
 	ofd = create_client_file(node, port);
 
 	pid_array = create_all_readers(node, port, pagesize, msg_handle);
-	if (!pid_array)
+	if (!pid_array) {
+		close(ofd);
 		return -ENOMEM;
+	}
 
 	/* on signal stop this msg */
 	stop_msg_handle = msg_handle;
@@ -728,6 +730,7 @@ static int process_client(struct tracecmd_msg_handle *msg_handle,
 					msg_handle->version < V3_PROTOCOL);
 
 	destroy_all_readers(cpus, pid_array, node, port);
+	close(ofd);
 
 	return ret;
 }
@@ -992,16 +995,12 @@ static void do_accept_loop(int sfd)
 	clean_up();
 }
 
-static void make_pid_file(void)
+void make_pid_file(const char *pidfile_basename)
 {
 	char buf[PATH_MAX];
-	int mode = do_daemon;
 	int fd;
 
-	if (!do_daemon)
-		return;
-
-	make_pid_name(mode, buf);
+	make_pid_name(buf, pidfile_basename);
 
 	fd = open(buf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	if (fd < 0) {
@@ -1055,6 +1054,7 @@ static int get_network(char *port)
 		if (sfd < 0)
 			continue;
 
+		set_tcp_no_delay(sfd, rp->ai_socktype);
 		if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
 			break;
 
@@ -1076,7 +1076,8 @@ static void do_listen(char *port)
 	if (!tracecmd_get_debug())
 		signal_setup(SIGCHLD, sigstub);
 
-	make_pid_file();
+	if (do_daemon)
+		make_pid_file(LISTEN_PIDFILE);
 
 	if (use_vsock)
 		sfd = get_vsock(port);
@@ -1091,7 +1092,8 @@ static void do_listen(char *port)
 
 	kill_clients();
 
-	remove_pid_file();
+	if (do_daemon)
+		remove_pid_file(LISTEN_PIDFILE);
 }
 
 static void start_daemon(void)

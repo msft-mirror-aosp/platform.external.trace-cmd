@@ -240,6 +240,22 @@ tsync_proto_select(const struct tracecmd_tsync_protos *protos,
 }
 
 /**
+ * tracecmd_tsync_get_proto - return the appropriate synchronization protocol
+ * @protos: The list of synchronization protocols to choose from
+ * @clock: The clock that is being used (or NULL for unknown).
+ *
+ * Retuns pointer to a protocol name, that can be used with the peer, or NULL
+ *	  in case there is no match with supported protocols.
+ *	  The returned string MUST NOT be freed by the caller
+ */
+__hidden const char *
+tracecmd_tsync_get_proto(const struct tracecmd_tsync_protos *protos,
+			 const char *clock, enum tracecmd_time_sync_role role)
+{
+	return tsync_proto_select(protos, clock, role);
+}
+
+/**
  * tracecmd_tsync_proto_getall - Returns list of all supported
  *				 time sync protocols
  * @protos: return, allocated list of time sync protocol names,
@@ -274,7 +290,7 @@ int tracecmd_tsync_proto_getall(struct tracecmd_tsync_protos **protos, const cha
 		goto error;
 	plist->names = calloc(count, sizeof(char *));
 	if (!plist->names)
-		return -1;
+		goto error;
 
 	for (i = 0, proto = tsync_proto_list; proto && i < (count - 1); proto = proto->next) {
 		if (!(proto->roles & role))
@@ -366,8 +382,7 @@ clock_synch_delete_instance(struct tracefs_instance *inst)
 	tracefs_instance_free(inst);
 }
 
-static int clock_context_init(struct tracecmd_time_sync *tsync,
-			      struct tsync_proto **proto, bool guest)
+static int clock_context_init(struct tracecmd_time_sync *tsync, bool guest)
 {
 	struct clock_sync_context *clock = NULL;
 	struct tsync_proto *protocol;
@@ -401,7 +416,7 @@ static int clock_context_init(struct tracecmd_time_sync *tsync,
 	if (protocol->clock_sync_init && protocol->clock_sync_init(tsync) < 0)
 		goto error;
 
-	*proto = protocol;
+	tsync->proto = protocol;
 
 	return 0;
 error:
@@ -523,9 +538,9 @@ static void restore_pin_to_cpu(cpu_set_t *mask)
 	CPU_FREE(mask);
 }
 
-static int tsync_send(struct tracecmd_time_sync *tsync,
-		      struct tsync_proto *proto, unsigned int cpu)
+static int tsync_send(struct tracecmd_time_sync *tsync, unsigned int cpu)
 {
+	struct tsync_proto *proto = tsync->proto;
 	cpu_set_t *old_set = NULL;
 	long long timestamp = 0;
 	long long scaling = 0;
@@ -545,15 +560,10 @@ static void tsync_with_host(struct tracecmd_time_sync *tsync)
 {
 	char protocol[TRACECMD_TSYNC_PNAME_LENGTH];
 	struct tsync_probe_request_msg probe;
-	struct tsync_proto *proto;
 	unsigned int command;
 	unsigned int size;
 	char *msg;
 	int ret;
-
-	clock_context_init(tsync, &proto, true);
-	if (!tsync->context)
-		return;
 
 	msg = (char *)&probe;
 	size = sizeof(probe);
@@ -566,7 +576,7 @@ static void tsync_with_host(struct tracecmd_time_sync *tsync)
 		if (ret || strncmp(protocol, TRACECMD_TSYNC_PROTO_NONE, TRACECMD_TSYNC_PNAME_LENGTH) ||
 		    command != TRACECMD_TIME_SYNC_CMD_PROBE)
 			break;
-		ret = tsync_send(tsync, proto, probe.cpu);
+		ret = tsync_send(tsync, probe.cpu);
 		if (ret)
 			break;
 	}
@@ -614,8 +624,9 @@ static int record_sync_sample(struct clock_sync_offsets *offsets, int array_step
 }
 
 static int tsync_get_sample(struct tracecmd_time_sync *tsync, unsigned int cpu,
-			    struct tsync_proto *proto, int array_step)
+			    int array_step)
 {
+	struct tsync_proto *proto = tsync->proto;
 	struct clock_sync_context *clock;
 	long long timestamp = 0;
 	long long scaling = 0;
@@ -656,18 +667,11 @@ static int tsync_with_guest(struct tracecmd_time_sync *tsync)
 {
 	struct tsync_probe_request_msg probe;
 	int ts_array_size = CLOCK_TS_ARRAY;
-	struct tsync_proto *proto;
 	struct timespec timeout;
 	bool first = true;
 	bool end = false;
 	int ret;
 	int i;
-
-	clock_context_init(tsync, &proto, false);
-	if (!tsync->context) {
-		pthread_barrier_wait(&tsync->first_sync);
-		return -1;
-	}
 
 	if (tsync->loop_interval > 0 &&
 	    tsync->loop_interval < (CLOCK_TS_ARRAY * 1000))
@@ -681,7 +685,7 @@ static int tsync_with_guest(struct tracecmd_time_sync *tsync)
 							  TRACECMD_TSYNC_PROTO_NONE,
 							  TRACECMD_TIME_SYNC_CMD_PROBE,
 							  sizeof(probe), (char *)&probe);
-			ret = tsync_get_sample(tsync, i, proto, ts_array_size);
+			ret = tsync_get_sample(tsync, i, ts_array_size);
 			if (ret)
 				break;
 		}
@@ -777,6 +781,10 @@ tracecmd_tsync_with_guest(unsigned long long trace_id, int loop_interval,
 	pthread_attr_init(&attrib);
 	pthread_attr_setdetachstate(&attrib, PTHREAD_CREATE_JOINABLE);
 
+	clock_context_init(tsync, false);
+	if (!tsync->context)
+		goto error;
+
 	ret = pthread_create(&tsync->thread, &attrib, tsync_host_thread, tsync);
 	if (ret)
 		goto error;
@@ -827,7 +835,7 @@ int tracecmd_write_guest_time_shift(struct tracecmd_output *handle,
 	int i, j;
 	int ret = -1;
 
-	if (!tsync->vcpu_count)
+	if (!tsync || !tsync->vcpu_count)
 		return -1;
 	vcount = 3 + (5 * tsync->vcpu_count);
 	vector = calloc(vcount, sizeof(struct iovec));
@@ -921,34 +929,15 @@ int tracecmd_tsync_with_guest_stop(struct tracecmd_time_sync *tsync)
 static void *tsync_agent_thread(void *data)
 {
 	struct tracecmd_time_sync *tsync = data;
-	long ret = 0;
-	int sd;
-
-	while (true) {
-		tracecmd_debug("Listening on fd:%d\n", tsync->msg_handle->fd);
-		sd = accept(tsync->msg_handle->fd, NULL, NULL);
-		tracecmd_debug("Accepted fd:%d\n", sd);
-		if (sd < 0) {
-			if (errno == EINTR)
-				continue;
-			ret = -1;
-			goto out;
-		}
-		break;
-	}
-	close(tsync->msg_handle->fd);
-	tsync->msg_handle->fd = sd;
 
 	tsync_with_host(tsync);
-
-out:
-	pthread_exit((void *)ret);
+	pthread_exit(NULL);
 }
 
 /**
  * tracecmd_tsync_with_host - Synchronize timestamps with host
  * @fd: File descriptor connecting with the host
- * @tsync_protos: List of tsync protocols, supported by the host
+ * @proto: The selected protocol
  * @clock: Trace clock, used for that session
  * @port: returned, VSOCKET port, on which the guest listens for tsync requests
  * @remote_id: Identifier to uniquely identify the remote host
@@ -961,25 +950,19 @@ out:
  * until tracecmd_tsync_with_host_stop() is called.
  */
 struct tracecmd_time_sync *
-tracecmd_tsync_with_host(int fd,
-			 const struct tracecmd_tsync_protos *tsync_protos,
-			 const char *clock, int remote_id, int local_id)
+tracecmd_tsync_with_host(int fd, const char *proto, const char *clock,
+			 int remote_id, int local_id)
 {
 	struct tracecmd_time_sync *tsync;
 	cpu_set_t *pin_mask = NULL;
 	pthread_attr_t attrib;
 	size_t mask_size = 0;
-	const char *proto;
 	int ret;
 
 	tsync = calloc(1, sizeof(struct tracecmd_time_sync));
 	if (!tsync)
 		return NULL;
 
-	proto = tsync_proto_select(tsync_protos, clock,
-				   TRACECMD_TIME_SYNC_ROLE_GUEST);
-	if (!proto)
-		goto error;
 	tsync->proto_name = strdup(proto);
 	tsync->msg_handle = tracecmd_msg_handle_alloc(fd, 0);
 	if (clock)
@@ -991,6 +974,10 @@ tracecmd_tsync_with_host(int fd,
 	pthread_attr_init(&attrib);
 	tsync->vcpu_count = tracecmd_count_cpus();
 	pthread_attr_setdetachstate(&attrib, PTHREAD_CREATE_JOINABLE);
+
+	clock_context_init(tsync, true);
+	if (!tsync->context)
+		goto error;
 
 	ret = pthread_create(&tsync->thread, &attrib, tsync_agent_thread, tsync);
 	if (ret) {
@@ -1032,26 +1019,4 @@ error:
 int tracecmd_tsync_with_host_stop(struct tracecmd_time_sync *tsync)
 {
 	return pthread_join(tsync->thread, NULL);
-}
-
-/**
- * tracecmd_tsync_get_selected_proto - Return the seleceted time sync protocol
- * @tsync: Time sync context, representing a running time sync session
- * @selected_proto: return, name of the selected time sync protocol for this session
- *
- * Returns 0 on success, or -1 in case of an error.
- *
- */
-int tracecmd_tsync_get_selected_proto(struct tracecmd_time_sync *tsync,
-				      char **selected_proto)
-{
-	if (!tsync)
-		return -1;
-
-	if (selected_proto) {
-		if (!tsync->proto_name)
-			return -1;
-		(*selected_proto) = strdup(tsync->proto_name);
-	}
-	return 0;
 }

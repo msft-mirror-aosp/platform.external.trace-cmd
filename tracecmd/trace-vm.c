@@ -35,7 +35,7 @@ static struct trace_guest *get_guest_by_name(const char *name)
 {
 	int i;
 
-	if (!guests)
+	if (!guests || !strlen(name))
 		return NULL;
 
 	for (i = 0; i < guests_len; i++)
@@ -54,20 +54,61 @@ bool trace_have_guests_pid(void)
 	return true;
 }
 
+/* Find all the tasks associated with the guest pid */
+static void find_tasks(struct trace_guest *guest)
+{
+	struct dirent *dent;
+	char *path;
+	DIR *dir;
+	int ret;
+	int tasks = 0;
+
+	ret = asprintf(&path, "/proc/%d/task", guest->pid);
+	if (ret < 0)
+		return;
+
+	dir = opendir(path);
+	free(path);
+	if (!dir)
+		return;
+
+	while ((dent = readdir(dir))) {
+		int *pids;
+		if (!(dent->d_type == DT_DIR && is_digits(dent->d_name)))
+			continue;
+		pids = realloc(guest->task_pids, sizeof(int) * (tasks + 2));
+		if (!pids)
+			break;
+		pids[tasks++] = strtol(dent->d_name, NULL, 0);
+		pids[tasks] = -1;
+		guest->task_pids = pids;
+	}
+	closedir(dir);
+}
+
+static void find_pid_by_cid(struct trace_guest *guest);
+
 static struct trace_guest *add_guest(unsigned int cid, const char *name)
 {
+	struct trace_guest *guest;
+
 	guests = realloc(guests, (guests_len + 1) * sizeof(*guests));
 	if (!guests)
 		die("allocating new guest");
-	memset(&guests[guests_len], 0, sizeof(struct trace_guest));
-	guests[guests_len].name = strdup(name);
-	if (!guests[guests_len].name)
-		die("allocating guest name");
-	guests[guests_len].cid = cid;
-	guests[guests_len].pid = -1;
-	guests_len++;
 
-	return &guests[guests_len - 1];
+	guest = &guests[guests_len++];
+
+	memset(guest, 0, sizeof(*guest));
+	guest->name = strdup(name);
+	if (!guest->name)
+		die("allocating guest name");
+	guest->cid = cid;
+	guest->pid = -1;
+
+	find_pid_by_cid(guest);
+	find_tasks(guest);
+
+	return guest;
 }
 
 static struct tracefs_instance *start_trace_connect(void)
@@ -239,6 +280,7 @@ static int stop_trace_connect(struct tracefs_instance *open_instance)
 
 	tep = tracefs_local_events_system(NULL, systems);
 
+	trace_fields.found_pid = -1;
 	trace_fields.sched_waking = tep_find_event_by_name(tep, "sched", "sched_waking");
 	if (!trace_fields.sched_waking)
 		goto out;
@@ -254,7 +296,6 @@ static int stop_trace_connect(struct tracefs_instance *open_instance)
 	if (!trace_fields.sched_next)
 		goto out;
 
-	trace_fields.found_pid = -1;
 	trace_fields.pids = NULL;
 	add_pid(&trace_fields.pids, getpid());
 	tracefs_iterate_raw_events(tep, open_instance, NULL, 0, callback, &trace_fields);
@@ -303,11 +344,8 @@ struct trace_guest *trace_get_guest(unsigned int cid, const char *name)
 
 	if (cid > 0) {
 		guest = get_guest_by_cid(cid);
-		if (!guest && name) {
+		if (!guest && name)
 			guest = add_guest(cid, name);
-			if (guest)
-				find_pid_by_cid(guest);
-		}
 	}
 	return guest;
 }
@@ -317,7 +355,6 @@ struct trace_guest *trace_get_guest(unsigned int cid, const char *name)
 #define VM_CID_ID	"address='"
 static void read_guest_cid(char *name)
 {
-	struct trace_guest *guest;
 	char *cmd = NULL;
 	char line[512];
 	char *cid;
@@ -339,9 +376,7 @@ static void read_guest_cid(char *name)
 		cid_id = strtol(cid + strlen(VM_CID_ID), NULL, 10);
 		if ((cid_id == INT_MIN || cid_id == INT_MAX) && errno == ERANGE)
 			continue;
-		guest = add_guest(cid_id, name);
-		if (guest)
-			find_pid_by_cid(guest);
+		add_guest(cid_id, name);
 		break;
 	}
 
@@ -385,4 +420,77 @@ int get_guest_vcpu_pid(unsigned int guest_cid, unsigned int guest_vcpu)
 			return guests[i].cpu_pid[guest_vcpu];
 	}
 	return -1;
+}
+
+/**
+ * trace_add_guest_info - Add the guest info into the trace file option
+ * @handle: The file handle that the guest info option is added to
+ * @instance: The instance that that represents the guest
+ *
+ * Adds information about the guest from the @instance into an option
+ * for the @instance. It records the trace_id, the number of CPUs,
+ * as well as the PIDs of the host that represent the CPUs.
+ */
+void
+trace_add_guest_info(struct tracecmd_output *handle, struct buffer_instance *instance)
+{
+	unsigned long long trace_id;
+	struct trace_guest *guest;
+	const char *name;
+	char *buf, *p;
+	int cpus;
+	int size;
+	int pid;
+	int i;
+
+	if (is_network(instance)) {
+		name = instance->name;
+		cpus = instance->cpu_count;
+		trace_id = instance->trace_id;
+	} else {
+		guest = trace_get_guest(instance->cid, NULL);
+		if (!guest)
+			return;
+		cpus = guest->cpu_max;
+		name = guest->name;
+		/*
+		 * If this is a proxy, the trace_id of the guest is
+		 * in the guest descriptor (added in trace_tsync_as_host().
+		 */
+		if (guest->trace_id)
+			trace_id = guest->trace_id;
+		else
+			trace_id = instance->trace_id;
+	}
+
+	size = strlen(name) + 1;
+	size += sizeof(long long);	/* trace_id */
+	size += sizeof(int);		/* cpu count */
+	size += cpus * 2 * sizeof(int);	/* cpu,pid pair */
+
+	buf = calloc(1, size);
+	if (!buf)
+		return;
+	p = buf;
+	strcpy(p, name);
+	p += strlen(name) + 1;
+
+	memcpy(p, &trace_id, sizeof(long long));
+	p += sizeof(long long);
+
+	memcpy(p, &cpus, sizeof(int));
+	p += sizeof(int);
+	for (i = 0; i < cpus; i++) {
+		if (is_network(instance))
+			pid = -1;
+		else
+			pid = guest->cpu_pid[i];
+		memcpy(p, &i, sizeof(int));
+		p += sizeof(int);
+		memcpy(p, &pid, sizeof(int));
+		p += sizeof(int);
+	}
+
+	tracecmd_add_option(handle, TRACECMD_OPTION_GUEST, size, buf);
+	free(buf);
 }

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 # trace-cmd version
 TC_VERSION = 3
-TC_PATCHLEVEL = 0
-TC_EXTRAVERSION = 3
+TC_PATCHLEVEL = 3
+TC_EXTRAVERSION = 1
 TRACECMD_VERSION = $(TC_VERSION).$(TC_PATCHLEVEL).$(TC_EXTRAVERSION)
 
 export TC_VERSION
@@ -11,8 +11,8 @@ export TC_EXTRAVERSION
 export TRACECMD_VERSION
 
 LIBTC_VERSION = 1
-LIBTC_PATCHLEVEL = 1
-LIBTC_EXTRAVERSION = 3
+LIBTC_PATCHLEVEL = 5
+LIBTC_EXTRAVERSION = 2
 LIBTRACECMD_VERSION = $(LIBTC_VERSION).$(LIBTC_PATCHLEVEL).$(LIBTC_EXTRAVERSION)
 
 export LIBTC_VERSION
@@ -23,7 +23,7 @@ export LIBTRACECMD_VERSION
 VERSION_FILE = ltc_version.h
 
 LIBTRACEEVENT_MIN_VERSION = 1.5
-LIBTRACEFS_MIN_VERSION = 1.3
+LIBTRACEFS_MIN_VERSION = 1.8
 
 MAKEFLAGS += --no-print-directory
 
@@ -144,7 +144,7 @@ endif
 ifndef NO_PYTHON
 PYTHON		:= ctracecmd.so
 
-PYTHON_VERS ?= python
+PYTHON_VERS ?= python3
 PYTHON_PKGCONFIG_VERS ?= $(PYTHON_VERS)
 
 # Can build python?
@@ -163,7 +163,7 @@ export NO_PYTHON
 # $(call test-build, snippet, ret) -> ret if snippet compiles
 #                                  -> empty otherwise
 test-build = $(if $(shell sh -c 'echo "$(1)" | \
-	$(CC) -o /dev/null -c -x c - > /dev/null 2>&1 && echo y'), $2)
+	$(CC) -o /dev/null -x c - > /dev/null 2>&1 && echo y'), $2)
 
 UDIS86_AVAILABLE := $(call test-build,\#include <udis86.h>, y)
 ifneq ($(strip $(UDIS86_AVAILABLE)), y)
@@ -183,6 +183,15 @@ endef
 
 # have flush/fua block layer instead of barriers?
 blk-flags := $(call test-build,$(BLK_TC_FLUSH_SOURCE),-DHAVE_BLK_TC_FLUSH)
+
+define MEMFD_CREATE_SOURCE
+#define _GNU_SOURCE
+#include <sys/mman.h>
+int main(void) { return memfd_create(\"test\", 0); }
+endef
+
+# have memfd_create available
+memfd-flags := $(call test-build,$(MEMFD_CREATE_SOURCE),-DHAVE_MEMFD_CREATE)
 
 ifeq ("$(origin O)", "command line")
 
@@ -207,13 +216,13 @@ export pkgconfig_dir PKG_CONFIG_FILE
 
 export prefix bindir src obj
 
-LIBS = -ldl
+LIBS ?= -ldl
 
 LIBTRACECMD_DIR = $(obj)/lib/trace-cmd
 LIBTRACECMD_STATIC = $(LIBTRACECMD_DIR)/libtracecmd.a
 LIBTRACECMD_SHARED = $(LIBTRACECMD_DIR)/libtracecmd.so.$(LIBTRACECMD_VERSION)
-LIBTRACECMD_SHARED_VERSION = $(shell echo $(LIBTRACECMD_SHARED) | sed -e 's/\(\.so\.[0-9]*\).*/\1/')
-LIBTRACECMD_SHARED_SO = $(shell echo $(LIBTRACECMD_SHARED) | sed -e 's/\(\.so\).*/\1/')
+LIBTRACECMD_SHARED_VERSION := $(shell echo $(LIBTRACECMD_SHARED) | sed -e 's/\(\.so\.[0-9]*\).*/\1/')
+LIBTRACECMD_SHARED_SO := $(shell echo $(LIBTRACECMD_SHARED) | sed -e 's/\(\.so\).*/\1/')
 
 export LIBTRACECMD_STATIC LIBTRACECMD_SHARED
 export LIBTRACECMD_SHARED_VERSION LIBTRACECMD_SHARED_SO
@@ -221,12 +230,12 @@ export LIBTRACECMD_SHARED_VERSION LIBTRACECMD_SHARED_SO
 LIBTRACEEVENT=libtraceevent
 LIBTRACEFS=libtracefs
 
-TEST_LIBTRACEEVENT = $(shell sh -c "$(PKG_CONFIG) --atleast-version $(LIBTRACEEVENT_MIN_VERSION) $(LIBTRACEEVENT) > /dev/null 2>&1 && echo y")
-TEST_LIBTRACEFS = $(shell sh -c "$(PKG_CONFIG) --atleast-version $(LIBTRACEFS_MIN_VERSION) $(LIBTRACEFS) > /dev/null 2>&1 && echo y")
+TEST_LIBTRACEEVENT := $(shell sh -c "$(PKG_CONFIG) --atleast-version $(LIBTRACEEVENT_MIN_VERSION) $(LIBTRACEEVENT) > /dev/null 2>&1 && echo y")
+TEST_LIBTRACEFS := $(shell sh -c "$(PKG_CONFIG) --atleast-version $(LIBTRACEFS_MIN_VERSION) $(LIBTRACEFS) > /dev/null 2>&1 && echo y")
 
 ifeq ("$(TEST_LIBTRACEEVENT)", "y")
-LIBTRACEEVENT_CFLAGS = $(shell sh -c "$(PKG_CONFIG) --cflags $(LIBTRACEEVENT)")
-LIBTRACEEVENT_LDLAGS = $(shell sh -c "$(PKG_CONFIG) --libs $(LIBTRACEEVENT)")
+LIBTRACEEVENT_CFLAGS := $(shell sh -c "$(PKG_CONFIG) --cflags $(LIBTRACEEVENT)")
+LIBTRACEEVENT_LDLAGS := $(shell sh -c "$(PKG_CONFIG) --libs $(LIBTRACEEVENT)")
 else
 .PHONY: warning
 warning:
@@ -244,8 +253,8 @@ endif
 export LIBTRACEEVENT_CFLAGS LIBTRACEEVENT_LDLAGS
 
 ifeq ("$(TEST_LIBTRACEFS)", "y")
-LIBTRACEFS_CFLAGS = $(shell sh -c "$(PKG_CONFIG) --cflags $(LIBTRACEFS)")
-LIBTRACEFS_LDLAGS = $(shell sh -c "$(PKG_CONFIG) --libs $(LIBTRACEFS)")
+LIBTRACEFS_CFLAGS := $(shell sh -c "$(PKG_CONFIG) --cflags $(LIBTRACEFS)")
+LIBTRACEFS_LDLAGS := $(shell sh -c "$(PKG_CONFIG) --libs $(LIBTRACEFS)")
 else
 .PHONY: warning
 warning:
@@ -307,15 +316,19 @@ endif
 ZLIB_INSTALLED := $(shell if (printf "$(pound)include <zlib.h>\n void main(){deflateInit(NULL, Z_BEST_COMPRESSION);}" | $(CC) -o /dev/null -x c - -lz >/dev/null 2>&1) ; then echo 1; else echo 0 ; fi)
 ifeq ($(ZLIB_INSTALLED), 1)
 export ZLIB_INSTALLED
+ZLIB_LDLAGS = -lz
 CFLAGS += -DHAVE_ZLIB
 $(info    Have zlib compression support)
 endif
 
-TEST_LIBZSTD = $(shell sh -c "$(PKG_CONFIG) --atleast-version 1.4.0 libzstd > /dev/null 2>&1 && echo y")
+export ZLIB_LDLAGS
+
+ifndef NO_LIBZSTD
+TEST_LIBZSTD := $(shell sh -c "$(PKG_CONFIG) --atleast-version 1.4.0 libzstd > /dev/null 2>&1 && echo y")
 
 ifeq ("$(TEST_LIBZSTD)", "y")
-LIBZSTD_CFLAGS = $(shell sh -c "$(PKG_CONFIG) --cflags libzstd")
-LIBZSTD_LDLAGS = $(shell sh -c "$(PKG_CONFIG) --libs libzstd")
+LIBZSTD_CFLAGS := $(shell sh -c "$(PKG_CONFIG) --cflags libzstd")
+LIBZSTD_LDLAGS := $(shell sh -c "$(PKG_CONFIG) --libs libzstd")
 CFLAGS += -DHAVE_ZSTD
 ZSTD_INSTALLED=1
 $(info    Have ZSTD compression support)
@@ -326,6 +339,7 @@ $(info	  *************************************************************)
 endif
 
 export LIBZSTD_CFLAGS LIBZSTD_LDLAGS ZSTD_INSTALLED
+endif
 
 CUNIT_INSTALLED := $(shell if (printf "$(pound)include <CUnit/Basic.h>\n void main(){CU_initialize_registry();}" | $(CC) -o /dev/null -x c - -lcunit >/dev/null 2>&1) ; then echo 1; else echo 0 ; fi)
 export CUNIT_INSTALLED
@@ -335,6 +349,9 @@ export INCLUDES
 
 # Required CFLAGS
 override CFLAGS += -D_GNU_SOURCE
+
+# Make sure 32 bit stat() works on large file systems
+override CFLAGS += -D_FILE_OFFSET_BITS=64
 
 ifndef NO_PTRACE
 ifneq ($(call try-cc,$(SOURCE_PTRACE),),y)
@@ -363,7 +380,7 @@ endif
 # Append required CFLAGS
 override CFLAGS += $(INCLUDES) $(VAR_DIR)
 override CFLAGS += $(PLUGIN_DIR_TRACECMD_SQ)
-override CFLAGS += $(udis86-flags) $(blk-flags)
+override CFLAGS += $(udis86-flags) $(blk-flags) $(memfd-flags)
 override LDFLAGS += $(udis86-ldflags)
 
 CMD_TARGETS = trace-cmd $(BUILD_PYTHON)
@@ -433,10 +450,13 @@ gui: force
 	@echo "  Please use its new home at https://git.kernel.org/pub/scm/utils/trace-cmd/kernel-shark.git/"
 	@echo "***************************"
 
-test: force $(LIBTRACECMD_STATIC)
+test: force trace-cmd
 ifneq ($(CUNIT_INSTALLED),1)
 	$(error CUnit framework not installed, cannot build unit tests))
 endif
+	$(Q)$(MAKE) -C $(src)/utest $@
+
+test_mem: force test
 	$(Q)$(MAKE) -C $(src)/utest $@
 
 plugins_tracecmd: force $(obj)/lib/trace-cmd/plugins/tracecmd_plugin_dir
@@ -468,7 +488,8 @@ TAGS:	force
 
 cscope: force
 	$(RM) cscope*
-	$(call find_tag_files) | cscope -b -q
+	$(call find_tag_files) > cscope.files
+	cscope -b -q -f cscope.out
 
 install_plugins_tracecmd: force
 	$(Q)$(MAKE) -C $(src)/lib/trace-cmd/plugins install_plugins
@@ -494,7 +515,7 @@ install_gui: force
 install_libs: libs
 	$(Q)$(MAKE) -C $(src)/lib/trace-cmd/ $@
 
-doc:
+doc: check_doc
 	$(MAKE) -C $(src)/Documentation all
 
 doc_clean:
@@ -503,7 +524,10 @@ doc_clean:
 install_doc:
 	$(MAKE) -C $(src)/Documentation install
 
-clean:
+check_doc: force
+	$(Q)$(src)/check-manpages.sh $(src)/Documentation/libtracecmd
+
+clean: clean_meson
 	$(RM) *.o *~ *.a *.so .*.d
 	$(RM) tags TAGS cscope* $(PKG_CONFIG_SOURCE_FILE) $(VERSION_FILE)
 	$(MAKE) -C $(src)/lib/trace-cmd clean
@@ -574,6 +598,18 @@ ctracecmd.so: force $(LIBTRACECMD_STATIC)
 PHONY += python
 python: $(PYTHON)
 
+meson:
+	$(MAKE) -f Makefile.meson
+
+meson_install:
+	$(MAKE) -f Makefile.meson install
+
+meson_docs:
+	$(MAKE) -f Makefile.meson docs
+
+PHONY += clean_meson
+clean_meson:
+	$(Q)$(MAKE) -f Makefile.meson $@
 
 dist:
 	git archive --format=tar --prefix=trace-cmd-$(TRACECMD_VERSION)/ HEAD \

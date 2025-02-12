@@ -5,7 +5,6 @@
  * Several of the ideas in this file came from Arnaldo Carvalho de Melo's
  * work on the perf ui.
  */
-#define _LARGEFILE64_SOURCE
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1044,8 +1043,10 @@ void trace_hist(int argc, char **argv)
 		die("can't open %s\n", input_file);
 
 	ret = tracecmd_read_headers(handle, 0);
-	if (ret)
+	if (ret) {
+		tracecmd_close(handle);
 		return;
+	}
 
 	ret = tracecmd_init_data(handle);
 	if (ret < 0)
