@@ -49,6 +49,15 @@ struct data_file_write {
 	unsigned long long	file_data_offset;
 };
 
+enum tracecmd_filters tracecmd_filter_match(struct tracecmd_filter *filter,
+					    struct tep_record *record);
+
+void trace_set_guest_map(struct tracecmd_input *handle, struct tracecmd_cpu_map *map);
+struct tracecmd_cpu_map *trace_get_guest_map(struct tracecmd_input *handle);
+void trace_set_guest_map_cnt(struct tracecmd_input *handle, int count);
+int trace_get_guest_map_cnt(struct tracecmd_input *handle);
+void trace_guest_map_free(struct tracecmd_cpu_map *map);
+
 void tracecmd_compress_init(void);
 void tracecmd_compress_free(void);
 
@@ -84,15 +93,22 @@ out_add_buffer_option(struct tracecmd_output *handle, const char *name,
 
 struct cpu_data_source {
 	int fd;
-	int size;
-	off64_t offset;
+	ssize_t size;
+	off_t offset;
 };
 
 int out_write_cpu_data(struct tracecmd_output *handle, int cpus,
 		       struct cpu_data_source *data, const char *buff_name);
 int out_write_emty_cpu_data(struct tracecmd_output *handle, int cpus);
-off64_t msg_lseek(struct tracecmd_msg_handle *msg_handle, off64_t offset, int whence);
+off_t msg_lseek(struct tracecmd_msg_handle *msg_handle, off_t offset, int whence);
 unsigned long long get_last_option_offset(struct tracecmd_input *handle);
 unsigned int get_meta_strings_size(struct tracecmd_input *handle);
+int trace_append_options(struct tracecmd_output *handle, void *buf, size_t len);
+void *trace_get_options(struct tracecmd_output *handle, size_t *len);
+
+/* filters */
+struct tracecmd_filter *tracecmd_filter_get(struct tracecmd_input *handle);
+void tracecmd_filter_set(struct tracecmd_input *handle, struct tracecmd_filter *filter);
+void tracecmd_filter_free(struct tracecmd_filter *filter);
 
 #endif /* _TRACE_CMD_LOCAL_H */
