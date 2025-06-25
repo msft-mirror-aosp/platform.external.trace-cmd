@@ -127,6 +127,7 @@ cc_library {
     ],
 
     c_std: "gnu99",
+    vendor_available: true,
 }
 
 tracecmd_cflags = [
