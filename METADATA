@@ -14,7 +14,7 @@ third_party {
   identifier {
     type: "Git"
     value: "https://git.kernel.org/pub/scm/utils/trace-cmd/trace-cmd.git"
-    version: "feccafd3c682f4d09b3bb9f04752f3196e0e262e"
+    version: "5f20c4770b6ca280999e553c54afb58f03bd9c4f"
     closest_version: "trace-cmd-v3.3.1"
   }
 }
